@@ -1,0 +1,90 @@
+rpcrace.conf — Configuration Reference
+=======================================
+
+The rpcrace configuration file is a JSON document. Copy rpcrace.conf.example
+to rpcrace.conf and edit to match your environment.
+
+NODES
+-----
+"nodes" — Array of upstream Bitcoin nodes (1 to 8 entries).
+
+Each node object has the following fields:
+
+  "label"        — Human-readable name used in log messages and statistics.
+                   Must be unique across all nodes.
+
+  "host"         — IP address or hostname of the Bitcoin node's RPC interface.
+
+  "rpc_port"     — TCP port for the Bitcoin node's RPC interface (typically 8332
+                   for mainnet, 18332 for testnet).
+
+  "zmq_port"     — (Optional) ZMQ hashblock notification port number.
+                   Corresponds to the port in the node's zmqpubhashblock setting.
+                   The endpoint is constructed at runtime as tcp://<host>:<zmq_port>.
+                   If omitted or 0, the node must use HTTP blocknotify instead:
+                     blocknotify=wget -q -O /dev/null http://<rpcrace_ip>:<http_server_port>/NOTIFY/%s
+
+At least one notification method per node is expected — either ZMQ (configured
+here) or HTTP blocknotify (configured on the Bitcoin node itself).
+
+RPC LISTENER
+------------
+"rpc_server_bind"  — Bind address for the RPC listener that stratum proxies connect to.
+                     "127.0.0.1" — localhost only (recommended for single-machine setups)
+                     "0.0.0.0"   — all interfaces (use when stratum proxy is on another host)
+                     Or a specific interface IP address.
+
+"rpc_server_port"  — TCP port for the RPC listener. The stratum proxy connects here.
+                     Using 8332 makes rpcrace a transparent drop-in for a local bitcoind.
+
+HTTP LISTENER
+-------------
+"http_server_bind" — Bind address for the HTTP listener serving /NOTIFY and /stats.
+                     "0.0.0.0" — all interfaces (needed if Bitcoin nodes send blocknotify
+                     from remote hosts).
+
+"http_server_port" — TCP port for the HTTP listener. Bitcoin nodes send blocknotify
+                     requests here, and operators query /stats here.
+
+DOWNSTREAM NOTIFICATION RELAY
+-----------------------------
+"zmq_server_bind"  — (Optional) Bind address for the ZMQ PUB socket that relays block
+                     notifications to the stratum proxy. Default: "0.0.0.0".
+                     The stratum proxy subscribes to this endpoint for hashblock
+                     messages in Bitcoin Core's ZMQ format.
+
+"zmq_server_port"  — (Optional) Port for the ZMQ PUB socket. Set to a non-zero value
+                     to enable ZMQ downstream relay. If omitted or 0, ZMQ relay is
+                     disabled.
+
+"notify_http_url"  — (Optional) HTTP GET URL for relaying block notifications
+                     to the stratum proxy. If the URL contains "%s", it is
+                     replaced with the 64-character hex block hash. If "%s" is
+                     absent, the URL is requested as-is.
+
+At least one downstream notification method should be configured. If neither is
+set, rpcrace logs a warning at startup.
+
+TIMEOUTS AND TUNING
+-------------------
+"rpc_timeout_ms"     — Global timeout in milliseconds for all upstream RPC requests.
+                       If a node does not respond within this time, the request is
+                       treated as an error from that node. Default: 30000 (30 seconds).
+
+"reconnect_delay_ms" — Base delay in milliseconds before attempting to reconnect
+                       to a failed upstream node. Uses exponential backoff up to
+                       a 30-second cap. Default: 1000 (1 second).
+
+"stall_threshold_ms" — If the event loop does not process any event within this
+                       many milliseconds, rpcrace logs a critical error and exits
+                       to allow the process supervisor to restart it.
+                       Default: 60000 (60 seconds).
+
+LOGGING
+-------
+"log_verbosity" — Controls log output level. Messages at or below this level
+                  are emitted to stderr.
+                  0 = CRIT  — Process-fatal errors only
+                  1 = WARN  — Slow responses, connection failures, buffer warnings
+                  2 = INFO  — Race winners, notify events, RPC method names (recommended)
+                  3 = DEBUG — Per-node response details, timer firings, buffer sizes

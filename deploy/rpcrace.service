@@ -1,0 +1,33 @@
+[Unit]
+Description=rpcrace - Bitcoin RPC proxy and block notification relay
+Documentation=https://github.com/your-org/rpcrace
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/rpcrace /etc/rpcrace/rpcrace.conf
+Restart=on-failure
+RestartSec=5
+WatchdogSec=30
+
+# Security hardening
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+ReadWritePaths=/etc/rpcrace
+
+[Install]
+WantedBy=multi-user.target

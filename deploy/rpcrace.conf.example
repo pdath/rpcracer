@@ -1,0 +1,37 @@
+{
+    "nodes": [
+        {
+            "label": "local-knots",
+            "host": "127.0.0.1",
+            "rpc_port": 8332,
+            "zmq_port": 28332
+        },
+        {
+            "label": "remote-core",
+            "host": "10.0.1.50",
+            "rpc_port": 8332,
+            "zmq_port": 28332
+        },
+        {
+            "label": "cloud-node",
+            "host": "203.0.113.10",
+            "rpc_port": 8332
+        }
+    ],
+
+    "rpc_server_bind": "127.0.0.1",
+    "rpc_server_port": 8332,
+
+    "http_server_bind": "0.0.0.0",
+    "http_server_port": 37152,
+
+    "zmq_server_bind": "0.0.0.0",
+    "zmq_server_port": 28332,
+    "notify_http_url": "http://127.0.0.1:7152/NOTIFY/%s",
+
+    "rpc_timeout_ms": 30000,
+    "reconnect_delay_ms": 1000,
+    "stall_threshold_ms": 60000,
+
+    "log_verbosity": 2
+}
