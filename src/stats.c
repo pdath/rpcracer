@@ -13,7 +13,6 @@
 typedef struct {
     uint64_t gbt_response_time_us;  /* last GBT response time in microseconds */
     uint64_t gbt_total_time_us;     /* cumulative GBT response time */
-    uint32_t gbt_count;             /* number of GBT responses */
     uint32_t gbt_wins;              /* number of times this node won the GBT race */
     uint32_t gbt_last_tx_count;     /* transaction count from last GBT */
     uint64_t last_response_time_us; /* last response time for any RPC */
@@ -59,7 +58,6 @@ void stats_record_gbt(stats_t *s, int node_idx, uint64_t response_time_us,
     node_stats_t *ns = &s->per_node[node_idx];
     ns->gbt_response_time_us = response_time_us;
     ns->gbt_total_time_us += response_time_us;
-    ns->gbt_count++;
     ns->gbt_last_tx_count = tx_count;
     ns->last_response_time_us = response_time_us;
     ns->gbt_last_since_notify_us = since_notify_us;
@@ -163,8 +161,8 @@ int stats_serialize_json(char *buf, size_t cap, void *data)
 
         /* Average GBT response time */
         uint64_t avg_us = 0;
-        if (ns->gbt_count > 0)
-            avg_us = ns->gbt_total_time_us / ns->gbt_count;
+        if (ns->gbt_wins > 0)
+            avg_us = ns->gbt_total_time_us / ns->gbt_wins;
         yyjson_mut_obj_add_uint(doc, gbt_obj, "avg_us", avg_us);
 
         /* Last GBT response time */
@@ -177,9 +175,6 @@ int stats_serialize_json(char *buf, size_t cap, void *data)
 
         /* GBT wins */
         yyjson_mut_obj_add_uint(doc, gbt_obj, "wins", ns->gbt_wins);
-
-        /* GBT count */
-        yyjson_mut_obj_add_uint(doc, gbt_obj, "count", ns->gbt_count);
 
         /* Last tx count */
         yyjson_mut_obj_add_uint(doc, gbt_obj, "last_tx_count",

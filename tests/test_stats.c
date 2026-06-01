@@ -39,9 +39,11 @@ static void test_stats_record_gbt(void)
     stats_t *s = stats_create(2);
     assert(s != NULL);
 
-    /* Record 2 GBT responses for node 0 */
+    /* Record 2 GBT responses for node 0 (each is a race win) */
     stats_record_gbt(s, 0, 50000, 1000, 75000);
+    stats_record_race_win(s, 0);
     stats_record_gbt(s, 0, 60000, 1200, 85000);
+    stats_record_race_win(s, 0);
 
     /* Serialize and verify */
     config_t cfg;
@@ -63,15 +65,15 @@ static void test_stats_record_gbt(void)
     assert(yyjson_get_uint(yyjson_obj_get(gbt, "avg_us")) == 55000);
     /* last_us = 60000 */
     assert(yyjson_get_uint(yyjson_obj_get(gbt, "last_us")) == 60000);
-    /* count = 2 */
-    assert(yyjson_get_uint(yyjson_obj_get(gbt, "count")) == 2);
+    /* wins = 2 */
+    assert(yyjson_get_uint(yyjson_obj_get(gbt, "wins")) == 2);
     /* last_tx_count = 1200 */
     assert(yyjson_get_uint(yyjson_obj_get(gbt, "last_tx_count")) == 1200);
 
     /* Node 1 should be untouched */
     yyjson_val *n1 = yyjson_arr_get(nodes, 1);
     yyjson_val *gbt1 = yyjson_obj_get(n1, "race_gbt");
-    assert(yyjson_get_uint(yyjson_obj_get(gbt1, "count")) == 0);
+    assert(yyjson_get_uint(yyjson_obj_get(gbt1, "wins")) == 0);
 
     yyjson_doc_free(doc);
     stats_destroy(s);

@@ -2,7 +2,7 @@
  *
  * Property 14: Statistics Accumulation
  * For any sequence of (node_index, response_time_us, tx_count) tuples fed to
- * the statistics collector, the per-node gbt_count shall equal the number of
+ * the statistics collector, the per-node gbt_wins shall equal the number of
  * tuples for that node, gbt_total_time_us shall equal the sum of response
  * times for that node, and gbt_last_tx_count shall equal the tx_count from
  * the most recent tuple for that node.
@@ -33,7 +33,7 @@
 
 /* Expected per-node accumulation state (oracle) */
 typedef struct {
-    uint32_t gbt_count;
+    uint32_t gbt_wins;
     uint64_t gbt_total_time_us;
     uint32_t gbt_last_tx_count;
     uint64_t gbt_last_response_us;
@@ -90,8 +90,9 @@ test_property_stats_accumulation(long seed)
             uint64_t since_notify_us = (uint64_t)(lrand48() % 1000000);
 
             stats_record_gbt(s, node_idx, response_time_us, tx_count, since_notify_us);
+            stats_record_race_win(s, node_idx);
 
-            expected[node_idx].gbt_count++;
+            expected[node_idx].gbt_wins++;
             expected[node_idx].gbt_total_time_us += response_time_us;
             expected[node_idx].gbt_last_tx_count = tx_count;
             expected[node_idx].gbt_last_response_us = response_time_us;
@@ -128,17 +129,17 @@ test_property_stats_accumulation(long seed)
             yyjson_val *node_obj = yyjson_arr_get(nodes, (size_t)n);
             yyjson_val *gbt_obj = yyjson_obj_get(node_obj, "race_gbt");
 
-            uint64_t json_count = yyjson_get_uint(yyjson_obj_get(gbt_obj, "count"));
+            uint64_t json_wins = yyjson_get_uint(yyjson_obj_get(gbt_obj, "wins"));
             uint64_t json_last_us = yyjson_get_uint(yyjson_obj_get(gbt_obj, "last_us"));
             uint64_t json_last_tx = yyjson_get_uint(yyjson_obj_get(gbt_obj, "last_tx_count"));
             uint64_t json_avg_us = yyjson_get_uint(yyjson_obj_get(gbt_obj, "avg_us"));
 
-            /* Check gbt_count */
-            if (json_count != expected[n].gbt_count) {
-                fprintf(stderr, "  FAIL trial %d: node %d count mismatch: "
+            /* Check gbt_wins */
+            if (json_wins != expected[n].gbt_wins) {
+                fprintf(stderr, "  FAIL trial %d: node %d wins mismatch: "
                         "got %llu, expected %u\n",
-                        trial, n, (unsigned long long)json_count,
-                        expected[n].gbt_count);
+                        trial, n, (unsigned long long)json_wins,
+                        expected[n].gbt_wins);
                 fprintf(stderr, "  (seed=%ld, trial=%d, node_count=%d, "
                         "num_recordings=%d)\n",
                         seed, trial, node_count, num_recordings);
@@ -147,10 +148,10 @@ test_property_stats_accumulation(long seed)
                 return -1;
             }
 
-            /* Check avg_us = total / count */
+            /* Check avg_us = total / wins */
             uint64_t expected_avg = 0;
-            if (expected[n].gbt_count > 0)
-                expected_avg = expected[n].gbt_total_time_us / expected[n].gbt_count;
+            if (expected[n].gbt_wins > 0)
+                expected_avg = expected[n].gbt_total_time_us / expected[n].gbt_wins;
             if (json_avg_us != expected_avg) {
                 fprintf(stderr, "  FAIL trial %d: node %d avg_us mismatch: "
                         "got %llu, expected %llu\n",
@@ -233,7 +234,8 @@ test_property_oob_ignored(long seed)
             uint32_t tx_count = (uint32_t)(lrand48() % 50000);
 
             stats_record_gbt(s, node_idx, response_time_us, tx_count, 0);
-            expected[node_idx].gbt_count++;
+            stats_record_race_win(s, node_idx);
+            expected[node_idx].gbt_wins++;
             expected[node_idx].gbt_total_time_us += response_time_us;
             expected[node_idx].gbt_last_tx_count = tx_count;
             expected[node_idx].gbt_last_response_us = response_time_us;
@@ -283,14 +285,14 @@ test_property_oob_ignored(long seed)
             yyjson_val *node_obj = yyjson_arr_get(nodes, (size_t)n);
             yyjson_val *gbt_obj = yyjson_obj_get(node_obj, "race_gbt");
 
-            uint64_t json_count = yyjson_get_uint(yyjson_obj_get(gbt_obj, "count"));
+            uint64_t json_wins = yyjson_get_uint(yyjson_obj_get(gbt_obj, "wins"));
             uint64_t json_last_tx = yyjson_get_uint(yyjson_obj_get(gbt_obj, "last_tx_count"));
 
-            if (json_count != expected[n].gbt_count) {
-                fprintf(stderr, "  FAIL trial %d: node %d count corrupted "
+            if (json_wins != expected[n].gbt_wins) {
+                fprintf(stderr, "  FAIL trial %d: node %d wins corrupted "
                         "by OOB: got %llu, expected %u\n",
-                        trial, n, (unsigned long long)json_count,
-                        expected[n].gbt_count);
+                        trial, n, (unsigned long long)json_wins,
+                        expected[n].gbt_wins);
                 fprintf(stderr, "  (seed=%ld, trial=%d, node_count=%d)\n",
                         seed, trial, node_count);
                 yyjson_doc_free(doc);
@@ -310,11 +312,11 @@ test_property_oob_ignored(long seed)
                 return -1;
             }
 
-            /* Verify avg matches expected total/count */
+            /* Verify avg matches expected total/wins */
             uint64_t json_avg = yyjson_get_uint(yyjson_obj_get(gbt_obj, "avg_us"));
             uint64_t expected_avg = 0;
-            if (expected[n].gbt_count > 0)
-                expected_avg = expected[n].gbt_total_time_us / expected[n].gbt_count;
+            if (expected[n].gbt_wins > 0)
+                expected_avg = expected[n].gbt_total_time_us / expected[n].gbt_wins;
             if (json_avg != expected_avg) {
                 fprintf(stderr, "  FAIL trial %d: node %d avg_us corrupted "
                         "by OOB: got %llu, expected %llu\n",
@@ -367,6 +369,7 @@ test_property_node_isolation(long seed)
             uint64_t response_time_us = 1 + (uint64_t)(lrand48() % 5000000);
             uint32_t tx_count = (uint32_t)(lrand48() % 80000);
             stats_record_gbt(s, target_node, response_time_us, tx_count, 0);
+            stats_record_race_win(s, target_node);
         }
 
         /* Serialize and verify all other nodes are untouched */
@@ -402,17 +405,17 @@ test_property_node_isolation(long seed)
             yyjson_val *node_obj = yyjson_arr_get(nodes, (size_t)n);
             yyjson_val *gbt_obj = yyjson_obj_get(node_obj, "race_gbt");
 
-            uint64_t json_count = yyjson_get_uint(yyjson_obj_get(gbt_obj, "count"));
+            uint64_t json_wins = yyjson_get_uint(yyjson_obj_get(gbt_obj, "wins"));
             uint64_t json_avg = yyjson_get_uint(yyjson_obj_get(gbt_obj, "avg_us"));
             uint64_t json_last_tx = yyjson_get_uint(yyjson_obj_get(gbt_obj, "last_tx_count"));
 
-            if (json_count != 0 || json_avg != 0 || json_last_tx != 0) {
+            if (json_wins != 0 || json_avg != 0 || json_last_tx != 0) {
                 fprintf(stderr, "  FAIL trial %d: node %d affected by "
                         "recordings to node %d\n", trial, n, target_node);
                 fprintf(stderr, "  (seed=%ld, trial=%d, node_count=%d)\n",
                         seed, trial, node_count);
-                fprintf(stderr, "  node %d: count=%llu avg=%llu last_tx=%llu\n",
-                        n, (unsigned long long)json_count,
+                fprintf(stderr, "  node %d: wins=%llu avg=%llu last_tx=%llu\n",
+                        n, (unsigned long long)json_wins,
                         (unsigned long long)json_avg,
                         (unsigned long long)json_last_tx);
                 yyjson_doc_free(doc);

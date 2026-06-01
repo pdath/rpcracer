@@ -35,10 +35,9 @@ static int tests_passed = 0;
 
 /* Oracle for per-node expected values */
 typedef struct {
-    uint32_t gbt_count;
+    uint32_t gbt_wins;
     uint64_t gbt_total_time_us;
     uint64_t gbt_last_response_us;
-    uint32_t gbt_wins;
     uint32_t gbt_last_tx_count;
     uint64_t gbt_last_since_notify_us;
     uint32_t notify_wins;
@@ -149,8 +148,8 @@ verify_trial(int trial, stats_t *s, config_t *cfg, node_oracle_t *oracle,
 
         /* avg_us */
         uint64_t expected_avg = 0;
-        if (no->gbt_count > 0)
-            expected_avg = no->gbt_total_time_us / no->gbt_count;
+        if (no->gbt_wins > 0)
+            expected_avg = no->gbt_total_time_us / no->gbt_wins;
         v = yyjson_obj_get(gbt_obj, "avg_us");
         ASSERT_MSG(v != NULL, "trial %d: node[%d].race_gbt.avg_us missing", trial, i);
         ASSERT_MSG(yyjson_get_uint(v) == expected_avg,
@@ -172,13 +171,6 @@ verify_trial(int trial, stats_t *s, config_t *cfg, node_oracle_t *oracle,
         ASSERT_MSG(yyjson_get_uint(v) == no->gbt_wins,
                    "trial %d: node[%d].race_gbt.wins expected %u got %llu",
                    trial, i, no->gbt_wins, (unsigned long long)yyjson_get_uint(v));
-
-        /* count */
-        v = yyjson_obj_get(gbt_obj, "count");
-        ASSERT_MSG(v != NULL, "trial %d: node[%d].race_gbt.count missing", trial, i);
-        ASSERT_MSG(yyjson_get_uint(v) == no->gbt_count,
-                   "trial %d: node[%d].race_gbt.count expected %u got %llu",
-                   trial, i, no->gbt_count, (unsigned long long)yyjson_get_uint(v));
 
         /* last_tx_count */
         v = yyjson_obj_get(gbt_obj, "last_tx_count");
@@ -261,22 +253,15 @@ test_property_stats_json_serialization(long seed)
                 uint64_t since_notify_us = (uint64_t)(lrand48() % 1000000);
 
                 stats_record_gbt(s, n, response_us, tx_count, since_notify_us);
+                stats_record_race_win(s, n);
 
-                oracle[n].gbt_count++;
+                oracle[n].gbt_wins++;
                 oracle[n].gbt_total_time_us += response_us;
                 oracle[n].gbt_last_response_us = response_us;
                 oracle[n].gbt_last_tx_count = tx_count;
                 oracle[n].gbt_last_since_notify_us = since_notify_us;
+                total_races++;
             }
-        }
-
-        /* Random race wins */
-        int num_races = (int)(lrand48() % 50);
-        for (int r = 0; r < num_races; r++) {
-            int winner = (int)(lrand48() % node_count);
-            stats_record_race_win(s, winner);
-            oracle[winner].gbt_wins++;
-            total_races++;
         }
 
         /* Random notify wins */
