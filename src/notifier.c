@@ -212,23 +212,29 @@ zmq_fd_event_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
 
     notifier_t *n = (notifier_t *)data;
 
-    /* Check ALL ZMQ sockets for pending messages.
-     * libzmq shares a single fd across all sockets in the same context,
-     * so when epoll signals readability we must drain all of them. */
-    for (int i = 0; i < n->zmq_sub_count; i++) {
-        int zmq_events = 0;
-        size_t opt_len = sizeof(zmq_events);
-        if (zmq_getsockopt(n->zmq_subs[i], ZMQ_EVENTS, &zmq_events,
-                           &opt_len) < 0) {
-            log_msg(LOG_WARN, "[notifier] [zmq] zmq_getsockopt(ZMQ_EVENTS) "
-                    "failed for socket %d", i);
-            continue;
-        }
+    /* With edge-triggered epoll and a shared ZMQ fd, we must re-check
+     * all sockets in a loop until none have pending messages. Reading
+     * from one socket can make messages available on another (libzmq
+     * shares internal signaling state across sockets in the same context). */
+    bool activity;
+    do {
+        activity = false;
+        for (int i = 0; i < n->zmq_sub_count; i++) {
+            int zmq_events = 0;
+            size_t opt_len = sizeof(zmq_events);
+            if (zmq_getsockopt(n->zmq_subs[i], ZMQ_EVENTS, &zmq_events,
+                               &opt_len) < 0) {
+                log_msg(LOG_WARN, "[notifier] [zmq] zmq_getsockopt(ZMQ_EVENTS) "
+                        "failed for socket %d", i);
+                continue;
+            }
 
-        if (zmq_events & ZMQ_POLLIN) {
-            drain_zmq_socket(n, n->zmq_subs[i], i);
+            if (zmq_events & ZMQ_POLLIN) {
+                drain_zmq_socket(n, n->zmq_subs[i], i);
+                activity = true;
+            }
         }
-    }
+    } while (activity);
 }
 
 /* ---- downstream relay helpers ---- */

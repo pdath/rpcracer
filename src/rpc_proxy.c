@@ -1134,17 +1134,22 @@ on_upstream_response(upstream_conn_t *conn, void *data)
                 (long long)proxy->best_gbt_height,
                 (unsigned long long)elapsed_us);
 
-        /* Log each GBT response at INFO with time since notify */
+        /* Log each GBT response at INFO with time since notify.
+         * If the request was dispatched before the notify arrived,
+         * since_notify_us is not meaningful (pre-notify request). */
         {
             uint64_t since_notify_us = 0;
-            if (proxy->last_notify_ns > 0) {
+            bool pre_notify = (proxy->last_notify_ns > 0 &&
+                               conn->request_start_ns < proxy->last_notify_ns);
+            if (proxy->last_notify_ns > 0 && !pre_notify) {
                 since_notify_us = (now_ns - proxy->last_notify_ns) / 1000;
             }
             log_msg(LOG_INFO, "[%s] GBT response: height=%lld elapsed_us=%llu "
-                    "since_notify_us=%llu",
+                    "since_notify_us=%llu%s",
                     conn->config->label, (long long)height,
                     (unsigned long long)elapsed_us,
-                    (unsigned long long)since_notify_us);
+                    (unsigned long long)since_notify_us,
+                    pre_notify ? " (pre-notify request)" : "");
         }
 
         int64_t expected_height = proxy->last_block_height + 1;
@@ -1176,7 +1181,8 @@ on_upstream_response(upstream_conn_t *conn, void *data)
             /* Record stats */
             if (proxy->stats) {
                 uint64_t since_notify_us = 0;
-                if (proxy->last_notify_ns > 0)
+                if (proxy->last_notify_ns > 0 &&
+                    conn->request_start_ns >= proxy->last_notify_ns)
                     since_notify_us = (now_ns - proxy->last_notify_ns) / 1000;
                 stats_record_gbt(proxy->stats, node_idx, elapsed_us, tx_count, since_notify_us);
                 stats_record_race_win(proxy->stats, node_idx);
@@ -1265,7 +1271,8 @@ on_upstream_response(upstream_conn_t *conn, void *data)
                 /* Record stats */
                 if (proxy->stats) {
                     uint64_t since_notify_us = 0;
-                    if (proxy->last_notify_ns > 0)
+                    if (proxy->last_notify_ns > 0 &&
+                        best_conn->request_start_ns >= proxy->last_notify_ns)
                         since_notify_us = (now_ns - proxy->last_notify_ns) / 1000;
                     stats_record_gbt(proxy->stats, best_idx, elapsed_us, tx_count, since_notify_us);
                     stats_record_race_win(proxy->stats, best_idx);
