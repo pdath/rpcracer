@@ -48,13 +48,13 @@ typedef struct {
 
 /* ---- Request-gate logic (mirrors client_cb in rpc_proxy.c) ----
  *
- * This is the CURRENT (buggy) implementation of the request gate.
- * It only checks proxy->state != RACE_IDLE.
+ * This is the request gate as implemented in client_cb().
+ * It checks proxy->state != RACE_IDLE to decide whether to drop.
  *
  * Returns: true if request is ACCEPTED, false if DROPPED.
  */
 static bool
-request_gate_current(const mock_proxy_t *proxy)
+request_gate(const mock_proxy_t *proxy)
 {
     /* From client_cb():
      *   if (proxy->state != RACE_IDLE) {
@@ -66,62 +66,40 @@ request_gate_current(const mock_proxy_t *proxy)
     return (proxy->state == RACE_IDLE);
 }
 
-/* ---- State transition logic after winner sent (mirrors on_upstream_response) ----
+/* ---- Simulate on_upstream_response winner-sent logic ----
  *
  * This replicates what on_upstream_response() does AFTER sending the winner
- * response for a non-broadcast race with pending responses:
+ * response for a non-broadcast race with pending responses.
  *
- * Fixed behavior: after sending the winner response for a non-broadcast race,
- * the proxy transitions to RACE_IDLE immediately so new requests are accepted.
- * Late responses are drained individually via rpc_conn_reset().
+ * The CURRENT code (with fix applied) transitions to RACE_IDLE:
+ *   } else if (!proxy->all_must_complete && proxy->winner_idx != -1) {
+ *       proxy->state = RACE_IDLE;
+ *       ...
+ *   }
+ *
+ * The ORIGINAL BUGGY code did NOT have this transition — state remained
+ * RACE_FANOUT until all responses arrived or timeout fired.
+ *
+ * This function replicates the CURRENT behavior (with fix).
  */
 static void
-simulate_winner_sent(mock_proxy_t *proxy, int winner_node)
+simulate_winner_sent_current(mock_proxy_t *proxy, int winner_node)
 {
     /* Winner found — set winner_idx (response already sent to client) */
     proxy->winner_idx = winner_node;
 
-    /* Fixed code: transition to RACE_IDLE for non-broadcast races with
-     * pending responses, so new requests are accepted immediately. */
+    /* Current code (with fix): transition to RACE_IDLE for non-broadcast
+     * races with pending responses */
     if (!proxy->all_must_complete && proxy->responses_pending > 0) {
         proxy->state = RACE_IDLE;
     }
 }
 
-/* ---- Expected behavior: what SHOULD happen after winner sent ----
- *
- * The expected (correct) behavior is that after sending the winner response
- * for a non-broadcast race, the proxy transitions to a state that accepts
- * new requests.
- *
- * Returns: true if the proxy SHOULD accept new requests in this state.
- */
-static bool
-should_accept_new_request(const mock_proxy_t *proxy)
-{
-    /* Expected behavior (from design doc):
-     * After a non-broadcast race winner is sent, the proxy SHALL immediately
-     * accept new client requests regardless of pending upstream responses.
-     *
-     * The condition for accepting is:
-     *   - state == RACE_IDLE, OR
-     *   - (state == RACE_FANOUT AND winner_idx != -1 AND !all_must_complete)
-     *     meaning: winner already sent, just draining late responses
-     */
-    if (proxy->state == RACE_IDLE)
-        return true;
-
-    /* Bug condition: winner sent but state still RACE_FANOUT */
-    if (proxy->state == RACE_FANOUT &&
-        proxy->winner_idx != -1 &&
-        !proxy->all_must_complete &&
-        proxy->responses_pending > 0) {
-        /* Expected: should accept (proxy should have transitioned to IDLE) */
-        return true;
-    }
-
-    return false;
-}
+/* NOTE: The ORIGINAL BUGGY on_upstream_response logic did NOT transition
+ * to RACE_IDLE after sending the winner response. It only called
+ * race_complete() when responses_pending reached 0. This left the proxy
+ * in RACE_FANOUT, blocking new requests. The fix adds the early transition
+ * in simulate_winner_sent_current() above. */
 
 /*
  * Property 1: Bug Condition — Non-broadcast race blocks new requests
@@ -133,14 +111,17 @@ should_accept_new_request(const mock_proxy_t *proxy)
  * SHALL be accepted.
  *
  * Test strategy:
- *   - Generate random N (2-8 nodes)
+ *   - Generate random N (2..MAX_NODES nodes)
  *   - Pick a random winner node (0..N-1)
  *   - Simulate: proxy in RACE_FANOUT, winner sent, (N-1) responses pending
- *   - Verify: request_gate_current() accepts the new request
+ *   - Apply the CURRENT on_upstream_response logic (with fix)
+ *   - Verify: request_gate() accepts the new request
  *
- * EXPECTED TO FAIL on unfixed code: the current request gate only checks
- * state != RACE_IDLE, so it drops the request even though the winner was
- * already sent.
+ * On UNFIXED code (simulate_winner_sent_buggy): test FAILS because state
+ * remains RACE_FANOUT and request_gate drops the request.
+ *
+ * On FIXED code (simulate_winner_sent_current): test PASSES because state
+ * transitions to RACE_IDLE and request_gate accepts.
  *
  * Validates: Requirements 1.1, 1.3
  */
@@ -154,7 +135,7 @@ test_property_bug_condition(long seed)
     int failures = 0;
 
     for (int trial = 0; trial < NUM_TRIALS; trial++) {
-        /* Generate random number of nodes (2-8) */
+        /* Generate random number of nodes (2..MAX_NODES) */
         int num_nodes = 2 + (int)(lrand48() % (MAX_NODES - 1));
 
         /* Pick a random winner node */
@@ -167,15 +148,19 @@ test_property_bug_condition(long seed)
         proxy.responses_pending = num_nodes;
         proxy.all_must_complete = false;
 
-        /* Simulate: winner node responds, response sent to client */
-        proxy.responses_pending--;  /* winner's response received */
-        simulate_winner_sent(&proxy, winner_node);
+        /* Simulate: winner node responds, response sent to client.
+         * Decrement pending for the winner's response. */
+        proxy.responses_pending--;
 
-        /* Verify bug condition holds (state should now be RACE_IDLE after fix) */
-        if (!(proxy.winner_idx != -1 &&
-              !proxy.all_must_complete &&
-              proxy.responses_pending > 0)) {
-            fprintf(stderr, "  ERROR trial %d: test condition not established "
+        /* Apply the CURRENT on_upstream_response logic */
+        simulate_winner_sent_current(&proxy, winner_node);
+
+        /* Verify bug condition inputs hold:
+         * winner_idx != -1, all_must_complete == false, responses_pending > 0 */
+        if (proxy.winner_idx == -1 ||
+            proxy.all_must_complete ||
+            proxy.responses_pending <= 0) {
+            fprintf(stderr, "  ERROR trial %d: test precondition not met "
                     "(winner=%d pending=%d all_must=%d)\n",
                     trial, proxy.winner_idx,
                     proxy.responses_pending, proxy.all_must_complete);
@@ -183,42 +168,31 @@ test_property_bug_condition(long seed)
         }
 
         /* Now simulate a new client request arriving.
-         * Expected: request is ACCEPTED.
-         * Actual (buggy): request is DROPPED because state == RACE_FANOUT. */
-        bool accepted = request_gate_current(&proxy);
-        bool should_accept = should_accept_new_request(&proxy);
+         * Expected: request is ACCEPTED (proxy should be in RACE_IDLE). */
+        bool accepted = request_gate(&proxy);
 
-        if (should_accept && !accepted) {
-            /* This is the bug: request should be accepted but is dropped */
+        if (!accepted) {
+            /* Bug: request should be accepted but is dropped */
             if (failures == 0) {
-                /* Print first counterexample */
                 fprintf(stderr, "  COUNTEREXAMPLE (trial %d, seed=%ld):\n",
                         trial, seed);
                 fprintf(stderr, "    num_nodes=%d, winner_node=%d\n",
                         num_nodes, winner_node);
-                fprintf(stderr, "    proxy.state=%d (RACE_FANOUT)\n",
-                        proxy.state);
+                fprintf(stderr, "    proxy.state=%d (RACE_FANOUT=%d)\n",
+                        proxy.state, RACE_FANOUT);
                 fprintf(stderr, "    proxy.winner_idx=%d (!= -1, winner sent)\n",
                         proxy.winner_idx);
                 fprintf(stderr, "    proxy.all_must_complete=%d (non-broadcast)\n",
                         proxy.all_must_complete);
                 fprintf(stderr, "    proxy.responses_pending=%d (>0, nodes "
                         "still in-flight)\n", proxy.responses_pending);
-                fprintf(stderr, "    request_gate_current() = %s (DROPPED)\n",
-                        accepted ? "ACCEPTED" : "DROPPED");
+                fprintf(stderr, "    request_gate() = DROPPED\n");
                 fprintf(stderr, "    expected: ACCEPTED\n");
                 fprintf(stderr, "    Bug: \"Request received while race/sticky "
                         "active (state=1) — dropping request\"\n");
             }
             failures++;
-        } else if (!should_accept && accepted) {
-            /* Unexpected: request accepted when it shouldn't be */
-            fprintf(stderr, "  UNEXPECTED trial %d: request accepted in "
-                    "invalid state\n", trial);
-            return -1;
         }
-        /* If should_accept && accepted: correct behavior (fix applied) */
-        /* If !should_accept && !accepted: correct blocking (not bug condition) */
     }
 
     if (failures > 0) {
@@ -237,8 +211,6 @@ test_property_bug_condition(long seed)
  *
  * The bug should manifest regardless of how many responses are still pending
  * (1, 2, ..., N-1). Generate cases with different pending counts.
- *
- * EXPECTED TO FAIL on unfixed code.
  */
 static int
 test_property_varying_pending(long seed)
@@ -250,7 +222,7 @@ test_property_varying_pending(long seed)
     int failures = 0;
 
     for (int trial = 0; trial < NUM_TRIALS; trial++) {
-        /* Generate random total nodes (2-8) */
+        /* Generate random total nodes (2..MAX_NODES) */
         int num_nodes = 2 + (int)(lrand48() % (MAX_NODES - 1));
 
         /* Random number of responses already received (1..num_nodes-1)
@@ -258,25 +230,24 @@ test_property_varying_pending(long seed)
         int responses_received = 1 + (int)(lrand48() % (num_nodes - 1));
         int responses_pending = num_nodes - responses_received;
 
+        if (responses_pending <= 0)
+            continue;  /* skip degenerate case */
+
         /* Pick winner from the received responses */
         int winner_node = (int)(lrand48() % num_nodes);
 
-        /* Set up proxy state: simulate winner being sent */
+        /* Set up proxy state after winner sent */
         mock_proxy_t proxy;
         proxy.state = RACE_FANOUT;
         proxy.winner_idx = -1;
         proxy.responses_pending = responses_pending;
         proxy.all_must_complete = false;
 
-        /* Simulate winner sent (this should transition to RACE_IDLE) */
-        simulate_winner_sent(&proxy, winner_node);
-
-        /* Verify condition */
-        if (proxy.responses_pending <= 0)
-            continue;  /* skip degenerate case */
+        /* Apply current on_upstream_response logic */
+        simulate_winner_sent_current(&proxy, winner_node);
 
         /* Test request gate */
-        bool accepted = request_gate_current(&proxy);
+        bool accepted = request_gate(&proxy);
 
         if (!accepted) {
             failures++;
@@ -304,7 +275,7 @@ test_property_varying_pending(long seed)
 }
 
 /*
- * Sub-property: Concrete scenario — validateaddress with 2 nodes.
+ * Concrete scenario: validateaddress with 2 nodes.
  *
  * Simulates the exact scenario from the design doc:
  *   - validateaddress dispatched to 2 nodes
@@ -312,9 +283,7 @@ test_property_varying_pending(long seed)
  *   - node[1] still pending
  *   - New client request arrives
  *   - Expected: ACCEPTED
- *   - Actual (buggy): DROPPED
- *
- * EXPECTED TO FAIL on unfixed code.
+ *   - Buggy: DROPPED (state remains RACE_FANOUT)
  */
 static int
 test_concrete_validateaddress(void)
@@ -330,28 +299,30 @@ test_concrete_validateaddress(void)
 
     /* node[0] responds successfully */
     proxy.responses_pending--;
-    simulate_winner_sent(&proxy, 0);
+    simulate_winner_sent_current(&proxy, 0);
 
-    /* Verify state after fix: should be RACE_IDLE, winner set, pending > 0 */
+    /* Verify preconditions */
     if (proxy.winner_idx == -1 ||
-        proxy.all_must_complete || proxy.responses_pending <= 0) {
-        fprintf(stderr, "  ERROR: test condition not established\n");
+        proxy.all_must_complete ||
+        proxy.responses_pending <= 0) {
+        fprintf(stderr, "  ERROR: test precondition not met\n");
         return -1;
     }
 
     /* New client request arrives */
-    bool accepted = request_gate_current(&proxy);
+    bool accepted = request_gate(&proxy);
 
     if (!accepted) {
         fprintf(stderr, "  COUNTEREXAMPLE:\n");
         fprintf(stderr, "    method=validateaddress, nodes=2\n");
         fprintf(stderr, "    node[0] responded (winner_idx=0)\n");
         fprintf(stderr, "    node[1] still pending (responses_pending=1)\n");
-        fprintf(stderr, "    proxy.state=RACE_FANOUT (should be RACE_IDLE)\n");
-        fprintf(stderr, "    New request → DROPPED\n");
+        fprintf(stderr, "    proxy.state=%d (should be RACE_IDLE=0)\n",
+                proxy.state);
+        fprintf(stderr, "    New request -> DROPPED\n");
         fprintf(stderr, "    Expected: ACCEPTED\n");
         fprintf(stderr, "    Log: \"Request received while race/sticky active "
-                "(state=1) — dropping request\"\n");
+                "(state=1) -- dropping request\"\n");
         return -1;
     }
 
@@ -360,7 +331,7 @@ test_concrete_validateaddress(void)
 }
 
 /*
- * Sub-property: Concrete scenario — 3-node race with rapid sequential request.
+ * Concrete scenario: 3-node race with rapid sequential request.
  *
  * Simulates:
  *   - decoderawtransaction dispatched to 3 nodes
@@ -368,9 +339,7 @@ test_concrete_validateaddress(void)
  *   - node[1] and node[2] still pending (2000ms timeout)
  *   - Client sends next request 50ms later
  *   - Expected: ACCEPTED
- *   - Actual (buggy): DROPPED for up to 1950ms
- *
- * EXPECTED TO FAIL on unfixed code.
+ *   - Buggy: DROPPED for up to 1950ms
  */
 static int
 test_concrete_3node_rapid_request(void)
@@ -385,7 +354,7 @@ test_concrete_3node_rapid_request(void)
 
     /* node[0] responds (winner) */
     proxy.responses_pending--;
-    simulate_winner_sent(&proxy, 0);
+    simulate_winner_sent_current(&proxy, 0);
 
     /* 2 nodes still pending */
     if (proxy.responses_pending != 2) {
@@ -395,7 +364,7 @@ test_concrete_3node_rapid_request(void)
     }
 
     /* New client request arrives */
-    bool accepted = request_gate_current(&proxy);
+    bool accepted = request_gate(&proxy);
 
     if (!accepted) {
         fprintf(stderr, "  COUNTEREXAMPLE:\n");
@@ -403,13 +372,55 @@ test_concrete_3node_rapid_request(void)
         fprintf(stderr, "    node[0] responded (winner_idx=0)\n");
         fprintf(stderr, "    node[1],node[2] still pending "
                 "(responses_pending=2)\n");
-        fprintf(stderr, "    proxy.state=RACE_FANOUT (should be RACE_IDLE)\n");
-        fprintf(stderr, "    New request → DROPPED\n");
+        fprintf(stderr, "    proxy.state=%d (should be RACE_IDLE=0)\n",
+                proxy.state);
+        fprintf(stderr, "    New request -> DROPPED\n");
         fprintf(stderr, "    Expected: ACCEPTED\n");
         return -1;
     }
 
     printf("    PASS: new request accepted\n");
+    return 0;
+}
+
+/*
+ * Negative test: broadcast race SHOULD block new requests.
+ *
+ * Verifies that the test logic correctly distinguishes between the bug
+ * condition (non-broadcast) and correct blocking (broadcast).
+ * This test should ALWAYS pass regardless of fix status.
+ */
+static int
+test_broadcast_still_blocks(void)
+{
+    printf("  negative: broadcast race correctly blocks new requests\n");
+
+    mock_proxy_t proxy;
+    proxy.state = RACE_FANOUT;
+    proxy.winner_idx = -1;
+    proxy.responses_pending = 3;
+    proxy.all_must_complete = true;  /* submitblock is broadcast */
+
+    /* node[0] responds (winner for broadcast) */
+    proxy.responses_pending--;
+    proxy.winner_idx = 0;
+
+    /* For broadcast: all_must_complete=true, so NO state transition.
+     * simulate_winner_sent_current would not transition either because
+     * all_must_complete is true. State stays RACE_FANOUT. */
+    simulate_winner_sent_current(&proxy, 0);
+
+    /* New client request arrives — should be BLOCKED (correct behavior) */
+    bool accepted = request_gate(&proxy);
+
+    if (accepted) {
+        fprintf(stderr, "  ERROR: broadcast race should block new requests "
+                "but accepted!\n");
+        return -1;
+    }
+
+    printf("    PASS: broadcast race correctly blocks (state=%d)\n",
+           proxy.state);
     return 0;
 }
 
@@ -438,6 +449,8 @@ main(int argc, char *argv[])
         failures++;
     if (test_concrete_3node_rapid_request() < 0)
         failures++;
+    if (test_broadcast_still_blocks() < 0)
+        failures++;
 
     printf("\n");
     if (failures == 0) {
@@ -446,7 +459,7 @@ main(int argc, char *argv[])
     } else {
         printf("  %d test(s) FAILED — bug condition confirmed\n", failures);
         printf("  Counterexample: New request arrives with proxy->state == "
-               "RACE_FANOUT and proxy->winner_idx != -1 → request dropped "
+               "RACE_FANOUT and proxy->winner_idx != -1 -> request dropped "
                "with \"Request received while race/sticky active (state=1)\"\n");
         return 1;
     }

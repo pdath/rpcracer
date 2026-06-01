@@ -6,7 +6,7 @@ Fix the race state blocking bug where the RPC proxy stays in `RACE_FANOUT` after
 
 ## Tasks
 
-- [ ] 1. Write bug condition exploration test
+- [x] 1. Write bug condition exploration test
   - **Property 1: Bug Condition** - Non-broadcast race blocks new requests after winner sent
   - **IMPORTANT**: Write this property-based test BEFORE implementing the fix
   - **CRITICAL**: This test MUST FAIL on unfixed code — failure confirms the bug exists
@@ -28,7 +28,7 @@ Fix the race state blocking bug where the RPC proxy stays in `RACE_FANOUT` after
   - Mark task complete when test is written, deployed, run, and failure is documented
   - _Requirements: 1.1, 1.3_
 
-- [ ] 2. Write preservation property tests (BEFORE implementing fix)
+- [x] 2. Write preservation property tests (BEFORE implementing fix)
   - **Property 2: Preservation** - Broadcast races and sticky requests continue to block
   - **IMPORTANT**: Follow observation-first methodology
   - **IMPORTANT**: Write these tests BEFORE implementing the fix
@@ -49,9 +49,9 @@ Fix the race state blocking bug where the RPC proxy stays in `RACE_FANOUT` after
   - Mark task complete when tests are written, deployed, run, and passing on unfixed code
   - _Requirements: 3.1, 3.2, 3.4, 3.5, 3.6_
 
-- [ ] 3. Fix for race state blocking after non-broadcast winner sent
+- [x] 3. Fix for race state blocking after non-broadcast winner sent
 
-  - [ ] 3.1 Implement the fix in `src/rpc_proxy.c`
+  - [x] 3.1 Implement the fix in `src/rpc_proxy.c`
     - Add early state transition to RACE_IDLE after sending winning response for non-broadcast races
     - In `on_upstream_response()`, after the non-broadcast winner is sent to client (around line 1090), when `!proxy->all_must_complete && proxy->winner_idx != -1 && proxy->responses_pending > 0`:
       - Set `proxy->state = RACE_IDLE`
@@ -67,7 +67,7 @@ Fix the race state blocking bug where the RPC proxy stays in `RACE_FANOUT` after
     - _Preservation: Broadcast races (all_must_complete=true) unchanged; sticky requests unchanged; late response logging preserved_
     - _Requirements: 1.1, 1.2, 1.3, 2.1, 2.2, 2.3, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6_
 
-  - [ ] 3.2 Verify bug condition exploration test now passes
+  - [x] 3.2 Verify bug condition exploration test now passes
     - **Property 1: Expected Behavior** - Non-broadcast race accepts new requests after winner sent
     - **IMPORTANT**: Re-run the SAME test from task 1 — do NOT write a new test
     - The test from task 1 encodes the expected behavior (proxy accepts new requests after winner sent)
@@ -76,7 +76,7 @@ Fix the race state blocking bug where the RPC proxy stays in `RACE_FANOUT` after
     - **EXPECTED OUTCOME**: Test PASSES (confirms bug is fixed — proxy transitions to RACE_IDLE after non-broadcast winner)
     - _Requirements: 2.1, 2.2_
 
-  - [ ] 3.3 Verify preservation tests still pass
+  - [x] 3.3 Verify preservation tests still pass
     - **Property 2: Preservation** - Broadcast races and sticky requests continue to block
     - **IMPORTANT**: Re-run the SAME tests from task 2 — do NOT write new tests
     - Run preservation property tests from step 2
@@ -84,7 +84,7 @@ Fix the race state blocking bug where the RPC proxy stays in `RACE_FANOUT` after
     - Confirm all tests still pass after fix (no regressions)
     - _Requirements: 3.1, 3.2, 3.4, 3.5, 3.6_
 
-  - [ ] 3.4 Write integration test for late response draining
+  - [x] 3.4 Write integration test for late response draining
     - Create `tests/test_drain_late_responses.c` that verifies:
     - Late upstream responses arriving after early IDLE transition are logged with timing info and connections are reset
     - A new race dispatched while old connections are still draining skips those connections (dispatch_fanout checks conn->state != CONN_CONNECTED)
@@ -93,7 +93,7 @@ Fix the race state blocking bug where the RPC proxy stays in `RACE_FANOUT` after
     - Deploy and run: `scp -r tests/ odroid:~/rpcrace/ && ssh odroid "cd ~/rpcrace && make test"`
     - _Requirements: 2.3, 3.3_
 
-- [ ] 4. Checkpoint — Ensure all tests pass
+- [x] 4. Checkpoint — Ensure all tests pass
   - Deploy full project: `scp -r Makefile configure src/ include/ tests/ deploy/ odroid:~/rpcrace/`
   - Run full test suite: `ssh odroid "cd ~/rpcrace && ./configure && make clean && make && make test"`
   - Verify all existing tests still pass (no regressions in test_race_winner, test_slow_response, test_all_error_fallback, etc.)
@@ -105,10 +105,10 @@ Fix the race state blocking bug where the RPC proxy stays in `RACE_FANOUT` after
 ```json
 {
   "waves": [
-    ["1", "2"],
-    ["3.1"],
-    ["3.2", "3.3", "3.4"],
-    ["4"]
+    { "id": 0, "tasks": ["1", "2"] },
+    { "id": 1, "tasks": ["3.1"] },
+    { "id": 2, "tasks": ["3.2", "3.3", "3.4"] },
+    { "id": 3, "tasks": ["4"] }
   ]
 }
 ```

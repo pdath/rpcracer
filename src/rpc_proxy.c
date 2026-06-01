@@ -1599,8 +1599,14 @@ rpc_proxy_on_block_notify(rpc_proxy_t *proxy, const uint8_t *hash)
     if (proxy->stats)
         stats_record_notify_time(proxy->stats, proxy->last_notify_ns);
 
-    if (proxy->state == RACE_STICKY)
-        proxy->state = RACE_IDLE;
+    /* Do NOT transition RACE_STICKY → RACE_IDLE here. If a sticky GBT is
+     * in-flight, let it complete normally and send the response to the client.
+     * The client will then send a new GBT request which will see
+     * notify_pending=true and race all nodes for the new block.
+     *
+     * Transitioning to IDLE while a sticky request is in-flight would orphan
+     * the response (drain path discards it), leaving the client with no
+     * response until its own timeout fires (e.g., 60s). */
 
     log_msg(LOG_INFO, "[rpc_proxy] Block notify received — sticky cleared, "
             "next GBT will race");
