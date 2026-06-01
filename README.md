@@ -489,7 +489,73 @@ Query the stats endpoint for per-node performance metrics:
 curl http://localhost:9333/stats
 ```
 
-Returns JSON with per-node GBT response times, race win counts, transaction counts, and global timing metrics.
+### Example response
+
+```json
+{
+  "uptime_seconds": 86400,
+  "total_requests": 12045,
+  "total_gbt_races": 144,
+  "last_notify_to_gbt_us": 48320,
+  "nodes": [
+    {
+      "label": "local-node",
+      "race_gbt": {
+        "avg_us": 52000,
+        "last_us": 48320,
+        "since_notify_us": 48500,
+        "wins": 130,
+        "last_tx_count": 4200
+      },
+      "notify_wins": 98,
+      "state": "connected"
+    },
+    {
+      "label": "remote-node",
+      "race_gbt": {
+        "avg_us": 95000,
+        "last_us": 91000,
+        "since_notify_us": 91200,
+        "wins": 14,
+        "last_tx_count": 4198
+      },
+      "notify_wins": 46,
+      "state": "connected"
+    }
+  ]
+}
+```
+
+### Stats field reference
+
+#### Top-level fields
+
+| Field | Description |
+|-------|-------------|
+| `uptime_seconds` | Seconds since rpcrace started |
+| `total_requests` | Total RPC requests proxied (all methods) |
+| `total_gbt_races` | Number of GBT races completed (one per block notification) |
+| `last_notify_to_gbt_us` | Microseconds from the last block notification to the winning GBT response |
+
+#### Per-node fields (`nodes[]`)
+
+| Field | Description |
+|-------|-------------|
+| `label` | Node label from config |
+| `notify_wins` | Times this node was first to deliver a block notification |
+| `state` | Live connection state: `connected`, `connecting`, `backoff`, or `unknown` |
+
+#### GBT race fields (`nodes[].race_gbt`)
+
+These values are only updated when a node wins the race, so they reflect the results from that node's most recent win.
+
+| Field | Description |
+|-------|-------------|
+| `avg_us` | Average GBT response time in microseconds (cumulative time / wins) |
+| `last_us` | Most recent GBT response time in microseconds |
+| `since_notify_us` | Microseconds from block notification to this node's last GBT response |
+| `wins` | Times this node returned the fastest valid GBT response |
+| `last_tx_count` | Transaction count from this node's most recent GBT response |
 
 ## Port Reference
 

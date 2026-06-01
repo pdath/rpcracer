@@ -1006,9 +1006,28 @@ rpc_timeout_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
     ssize_t r = read(fd, &expirations, sizeof(expirations));
     (void)r;
 
-    /* Only act if a race is still in progress */
-    if (proxy->state == RACE_IDLE)
+    /* If proxy is IDLE, this timeout is a drain safety net: reset any
+     * connections still stuck in CONN_RECEIVING from a previous race. */
+    if (proxy->state == RACE_IDLE) {
+        int drained = 0;
+        for (int i = 0; i < proxy->upstream_count; i++) {
+            upstream_conn_t *conn = &proxy->upstreams[i];
+            if (conn->state == CONN_RECEIVING || conn->state == CONN_SENDING) {
+                log_msg(LOG_WARN, "[%s] Drain timeout: resetting stuck "
+                        "connection (state=%s, method=%s)",
+                        conn->config->label,
+                        conn->state == CONN_RECEIVING ? "RECEIVING" : "SENDING",
+                        proxy->method);
+                rpc_conn_reset(conn);
+                drained++;
+            }
+        }
+        if (drained > 0)
+            log_msg(LOG_INFO, "[rpc_proxy] Drain timeout reset %d stuck "
+                    "connection(s)", drained);
+        cancel_rpc_timeout(proxy);
         return;
+    }
 
     log_msg(LOG_WARN, "[rpc_proxy] RPC timeout (%u ms) fired for method=%s, "
             "%d responses still pending",
@@ -1067,6 +1086,31 @@ on_upstream_response(upstream_conn_t *conn, void *data)
     uint64_t elapsed_ns = (conn->request_start_ns > 0)
                           ? (now_ns - conn->request_start_ns) : 0;
     uint64_t elapsed_us = elapsed_ns / 1000;
+
+    /* Handle late response during drain: proxy already transitioned to IDLE
+     * after sending a non-broadcast winner, but this connection was still
+     * receiving from the previous race. Log and reset just this connection. */
+    if (proxy->state == RACE_IDLE && conn->state == CONN_RECEIVING) {
+        log_msg(LOG_DEBUG, "[%s] Late response during drain: method=%s "
+                "elapsed_us=%llu (discarding)",
+                conn->config->label, proxy->method,
+                (unsigned long long)elapsed_us);
+        rpc_conn_reset(conn);
+
+        /* If no more connections are draining, cancel the safety timeout */
+        bool still_draining = false;
+        for (int i = 0; i < proxy->upstream_count; i++) {
+            if (proxy->upstreams[i].state == CONN_RECEIVING ||
+                proxy->upstreams[i].state == CONN_SENDING) {
+                still_draining = true;
+                break;
+            }
+        }
+        if (!still_draining)
+            cancel_rpc_timeout(proxy);
+
+        return;
+    }
 
     /* Req 9.9: Log warning if elapsed > 5s identifying slow node */
     if (should_log_slow_response(elapsed_us)) {
@@ -1293,11 +1337,31 @@ on_upstream_response(upstream_conn_t *conn, void *data)
         }
         race_complete(proxy);
     } else if (!proxy->all_must_complete && proxy->winner_idx != -1) {
-        /* For non-broadcast: we have a winner but still waiting for others.
-         * Let them complete naturally (Req 4.2: allow all to complete,
-         * discard late responses). Don't reset yet. */
-        log_msg(LOG_DEBUG, "[rpc_proxy] Winner found, %d responses still "
-                "pending (will discard)", proxy->responses_pending);
+        /* Non-broadcast winner sent: transition to IDLE immediately so new
+         * client requests are accepted. Late responses from still-pending
+         * nodes will be caught by the early drain check at the top of this
+         * function and reset individually.
+         *
+         * Keep the RPC timeout running as a safety net: if draining
+         * connections never receive a response (node stuck, connection
+         * idle), the timeout will fire and reset them. */
+        proxy->state = RACE_IDLE;
+
+        /* Reset the winner's connection immediately — its response has been
+         * fully read and sent to the client, so it can return to
+         * CONN_CONNECTED for the next request. Also reset the current
+         * connection if it's different from the winner. */
+        upstream_conn_t *winner_conn = &proxy->upstreams[proxy->winner_idx];
+        if (winner_conn->state == CONN_RECEIVING ||
+            winner_conn->state == CONN_SENDING)
+            rpc_conn_reset(winner_conn);
+        if (conn != winner_conn &&
+            (conn->state == CONN_RECEIVING || conn->state == CONN_SENDING))
+            rpc_conn_reset(conn);
+
+        log_msg(LOG_INFO, "[rpc_proxy] Non-broadcast winner sent, "
+                "transitioning to IDLE (%d responses draining)",
+                proxy->responses_pending);
     }
     /* For broadcast (all_must_complete): always wait for all to finish */
 }
@@ -1309,9 +1373,29 @@ on_upstream_error(upstream_conn_t *conn, void *data)
     rpc_proxy_t *proxy = (rpc_proxy_t *)data;
     int node_idx = conn->node_index;
 
-    /* Only process if we're in an active race/sticky state */
-    if (proxy->state == RACE_IDLE)
+    /* Handle late error during drain: proxy already transitioned to IDLE
+     * after sending a non-broadcast winner, but this connection errored
+     * from the previous race. Log and reset just this connection. */
+    if (proxy->state == RACE_IDLE) {
+        log_msg(LOG_DEBUG, "[%s] Late error during drain (node_index=%d, "
+                "method=%s) — resetting connection",
+                conn->config->label, node_idx, proxy->method);
+        rpc_conn_reset(conn);
+
+        /* If no more connections are draining, cancel the safety timeout */
+        bool still_draining = false;
+        for (int i = 0; i < proxy->upstream_count; i++) {
+            if (proxy->upstreams[i].state == CONN_RECEIVING ||
+                proxy->upstreams[i].state == CONN_SENDING) {
+                still_draining = true;
+                break;
+            }
+        }
+        if (!still_draining)
+            cancel_rpc_timeout(proxy);
+
         return;
+    }
 
     log_msg(LOG_WARN, "[%s] Upstream connection error during %s "
             "(node_index=%d)",
