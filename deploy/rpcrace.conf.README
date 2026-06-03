@@ -80,6 +80,14 @@ TIMEOUTS AND TUNING
                        to allow the process supervisor to restart it.
                        Default: 60000 (60 seconds).
 
+"gbt_retry_timeout_ms" — Maximum time in milliseconds to retry a post-notify
+                       getblocktemplate request when all upstream nodes fail
+                       simultaneously. During this window, the proxy polls for
+                       reconnected nodes and re-dispatches the GBT request if one
+                       becomes available. Set to 0 to disable retry (immediate
+                       error, legacy behavior). Valid range: 0-30000.
+                       Default: 5000 (5 seconds).
+
 LOGGING
 -------
 "log_verbosity" — Controls log output level. Messages at or below this level

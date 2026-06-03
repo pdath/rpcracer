@@ -38,6 +38,7 @@ typedef struct {
     uint32_t rpc_timeout_ms;       /* global RPC timeout in milliseconds */
     uint32_t reconnect_delay_ms;   /* delay before reconnection attempt */
     uint32_t stall_threshold_ms;   /* event loop stall detection threshold */
+    uint32_t gbt_retry_timeout_ms; /* GBT all-fail retry window, 0=disabled */
 
     /* Logging */
     int log_verbosity;             /* LOG_CRIT..LOG_DEBUG */

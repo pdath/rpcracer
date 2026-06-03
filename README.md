@@ -113,6 +113,7 @@ The `configure` script uses `pkg-config` to detect libzmq and verifies required 
 |--------|-------------|
 | `make` | Build the `rpcrace` binary |
 | `make test` | Build and run all unit tests |
+| `make sanitise` | Rebuild and run tests with ASan + UBSan enabled |
 | `make clean` | Remove build artifacts |
 | `make install` | Install binary to `/usr/local/bin` (or run form build directory) |
 

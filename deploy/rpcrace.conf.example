@@ -32,6 +32,7 @@
     "rpc_timeout_ms": 30000,
     "reconnect_delay_ms": 1000,
     "stall_threshold_ms": 60000,
+    "gbt_retry_timeout_ms": 5000,
 
     "log_verbosity": 2
 }

@@ -84,8 +84,13 @@ install: $(TARGET)
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -m 755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/
 
+# Sanitizer-enabled test run (ASan + UBSan)
+sanitise: CFLAGS  += -fsanitize=address,undefined -fno-omit-frame-pointer -O1
+sanitise: LDFLAGS += -fsanitize=address,undefined
+sanitise: clean all test
+
 # Clean
 clean:
 	rm -rf $(BUILDDIR) $(TARGET)
 
-.PHONY: all test clean install
+.PHONY: all test sanitise clean install

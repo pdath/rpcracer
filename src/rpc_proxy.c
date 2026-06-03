@@ -25,7 +25,8 @@
 typedef enum {
     RACE_IDLE,
     RACE_FANOUT,
-    RACE_STICKY
+    RACE_STICKY,
+    RACE_RETRY_WAIT
 } race_state_t;
 
 /* ---- Internal proxy structure ---- */
@@ -74,6 +75,12 @@ struct rpc_proxy {
 
     /* RPC timeout timer (one-shot timerfd, -1 when inactive) */
     int rpc_timeout_timer_fd;
+
+    /* GBT retry state (post-notify all-fail retry loop) */
+    int retry_timer_fd;             /* one-shot 100ms poll timerfd, -1 when inactive */
+    int retry_deadline_timer_fd;    /* one-shot deadline timerfd, -1 when inactive */
+    int retry_attempts;             /* number of re-dispatch attempts made */
+    bool is_post_notify_gbt;        /* true when current race is a post-notify GBT */
 };
 
 /* ---- Method routing strategies ---- */
@@ -109,6 +116,21 @@ static void rpc_timeout_cb(event_loop_t *loop, int fd, uint32_t events,
                            void *data);
 static void start_rpc_timeout(rpc_proxy_t *proxy);
 static void cancel_rpc_timeout(rpc_proxy_t *proxy);
+
+/* GBT retry helpers (implemented in tasks 3.4, 3.5, 3.6) */
+static void retry_poll_cb(event_loop_t *loop, int fd, uint32_t events,
+                          void *data);
+static void retry_deadline_cb(event_loop_t *loop, int fd, uint32_t events,
+                              void *data);
+static bool enter_retry_wait(rpc_proxy_t *proxy);
+
+/* ---- Method name constants ---- */
+static const char METHOD_GBT[] = "getblocktemplate";
+static const char METHOD_SUBMITBLOCK[] = "submitblock";
+static const char METHOD_SENDRAWTX[] = "sendrawtransaction";
+static const char METHOD_PRECIOUSBLOCK[] = "preciousblock";
+static const char METHOD_VALIDATEADDRESS[] = "validateaddress";
+static const char METHOD_DECODERAWTX[] = "decoderawtransaction";
 
 /* ---- Listener setup ---- */
 
@@ -328,7 +350,16 @@ client_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
             proxy->best_gbt_node_idx = -1;
             proxy->gbt_height_matched = false;
             if (dispatch_fanout(proxy) <= 0) {
-                /* No nodes available — return error immediately (Req 13.3) */
+                /* Post-notify GBT all-fail: enter retry wait instead of
+                 * immediate error (Req 2.3, 3.1, 3.4) */
+                if (proxy->is_post_notify_gbt &&
+                    strcmp(proxy->method, METHOD_GBT) == 0 &&
+                    enter_retry_wait(proxy)) {
+                    /* Retry wait entered successfully */
+                    break;
+                }
+                /* Non-GBT, non-post-notify, or retry disabled:
+                 * No nodes available — return error immediately (Req 13.3) */
                 log_msg(LOG_CRIT, "[rpc_proxy] All nodes unreachable for "
                         "method=%s", proxy->method);
                 send_rpc_error_to_client(proxy, -1,
@@ -491,14 +522,6 @@ extract_json_rpc_method(rpc_proxy_t *proxy)
 
 /* ---- Method routing classification ---- */
 
-/* Known method names for routing decisions */
-static const char METHOD_GBT[] = "getblocktemplate";
-static const char METHOD_SUBMITBLOCK[] = "submitblock";
-static const char METHOD_SENDRAWTX[] = "sendrawtransaction";
-static const char METHOD_PRECIOUSBLOCK[] = "preciousblock";
-static const char METHOD_VALIDATEADDRESS[] = "validateaddress";
-static const char METHOD_DECODERAWTX[] = "decoderawtransaction";
-
 /* Classify the current method into a routing strategy.
  * Also logs unexpected methods at LOG_WARN (Req 4.5). */
 static route_strategy_t
@@ -506,14 +529,20 @@ classify_method(rpc_proxy_t *proxy)
 {
     const char *method = proxy->method;
 
+    /* Default: not a post-notify GBT race. Only the post-notify GBT path
+     * below will override this to true. */
+    proxy->is_post_notify_gbt = false;
+
     if (strcmp(method, METHOD_GBT) == 0) {
         /* getblocktemplate: race if notify_pending or no sticky, else sticky */
         if (proxy->notify_pending || proxy->sticky_node_idx == -1) {
             /* First GBT after notify (or startup with no sticky) → race */
+            proxy->is_post_notify_gbt = proxy->notify_pending;
             proxy->notify_pending = false;
             return ROUTE_RACE;
         }
         /* Subsequent GBT → sticky (Req 5.4) */
+        proxy->is_post_notify_gbt = false;
         return ROUTE_STICKY;
     }
 
@@ -992,6 +1021,278 @@ cancel_rpc_timeout(rpc_proxy_t *proxy)
     proxy->rpc_timeout_timer_fd = -1;
 }
 
+/* ---- GBT retry wait helpers ---- */
+
+/* Enter the retry wait state for a post-notify GBT all-fail scenario.
+ * Returns true if retry was entered, false if retry is disabled
+ * (gbt_retry_timeout_ms == 0) and caller should fall through to
+ * original error behavior. */
+static bool
+enter_retry_wait(rpc_proxy_t *proxy)
+{
+    /* If retry is disabled, fall through to original error behavior */
+    if (proxy->cfg->gbt_retry_timeout_ms == 0)
+        return false;
+
+    /* Transition state to RACE_RETRY_WAIT */
+    proxy->state = RACE_RETRY_WAIT;
+
+    /* Reset all upstream connections */
+    for (int i = 0; i < proxy->upstream_count; i++) {
+        upstream_conn_t *conn = &proxy->upstreams[i];
+        if (conn->send_buf != NULL || conn->state == CONN_RECEIVING ||
+            conn->state == CONN_SENDING) {
+            rpc_conn_reset(conn);
+        }
+    }
+
+    /* Cancel existing RPC timeout timer */
+    cancel_rpc_timeout(proxy);
+
+    /* Create one-shot 100ms timerfd for retry polling */
+    int poll_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (poll_fd < 0) {
+        log_msg(LOG_WARN, "[rpc_proxy] timerfd_create for retry poll failed: %s",
+                strerror(errno));
+        /* Fall back to immediate error */
+        proxy->state = RACE_IDLE;
+        return false;
+    }
+
+    struct itimerspec poll_its = {0};
+    poll_its.it_value.tv_nsec = 100000000L;  /* 100ms */
+    /* it_interval left at zero → one-shot */
+
+    if (timerfd_settime(poll_fd, 0, &poll_its, NULL) < 0) {
+        log_msg(LOG_WARN, "[rpc_proxy] timerfd_settime for retry poll failed: %s",
+                strerror(errno));
+        close(poll_fd);
+        proxy->state = RACE_IDLE;
+        return false;
+    }
+
+    if (event_loop_add_fd(proxy->loop, poll_fd, EPOLLIN,
+                          retry_poll_cb, proxy) < 0) {
+        log_msg(LOG_WARN, "[rpc_proxy] event_loop_add_fd for retry poll failed");
+        close(poll_fd);
+        proxy->state = RACE_IDLE;
+        return false;
+    }
+
+    proxy->retry_timer_fd = poll_fd;
+
+    /* Create one-shot deadline timerfd for gbt_retry_timeout_ms */
+    int deadline_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (deadline_fd < 0) {
+        log_msg(LOG_WARN, "[rpc_proxy] timerfd_create for retry deadline failed: %s",
+                strerror(errno));
+        /* Clean up poll timer and fall back */
+        event_loop_del_fd(proxy->loop, proxy->retry_timer_fd);
+        close(proxy->retry_timer_fd);
+        proxy->retry_timer_fd = -1;
+        proxy->state = RACE_IDLE;
+        return false;
+    }
+
+    uint32_t deadline_ms = proxy->cfg->gbt_retry_timeout_ms;
+    struct itimerspec deadline_its = {0};
+    deadline_its.it_value.tv_sec = (time_t)(deadline_ms / 1000);
+    deadline_its.it_value.tv_nsec = (long)((deadline_ms % 1000) * 1000000);
+    /* it_interval left at zero → one-shot */
+
+    if (timerfd_settime(deadline_fd, 0, &deadline_its, NULL) < 0) {
+        log_msg(LOG_WARN, "[rpc_proxy] timerfd_settime for retry deadline failed: %s",
+                strerror(errno));
+        close(deadline_fd);
+        event_loop_del_fd(proxy->loop, proxy->retry_timer_fd);
+        close(proxy->retry_timer_fd);
+        proxy->retry_timer_fd = -1;
+        proxy->state = RACE_IDLE;
+        return false;
+    }
+
+    if (event_loop_add_fd(proxy->loop, deadline_fd, EPOLLIN,
+                          retry_deadline_cb, proxy) < 0) {
+        log_msg(LOG_WARN, "[rpc_proxy] event_loop_add_fd for retry deadline failed");
+        close(deadline_fd);
+        event_loop_del_fd(proxy->loop, proxy->retry_timer_fd);
+        close(proxy->retry_timer_fd);
+        proxy->retry_timer_fd = -1;
+        proxy->state = RACE_IDLE;
+        return false;
+    }
+
+    proxy->retry_deadline_timer_fd = deadline_fd;
+
+    log_msg(LOG_INFO, "[rpc_proxy] Entering retry wait for post-notify GBT "
+            "(timeout=%u ms)", deadline_ms);
+
+    return true;
+}
+
+/* Retry poll callback: fired every 100ms to check for reconnected nodes.
+ * Scans upstreams for CONN_CONNECTED, re-dispatches GBT if found. */
+static void
+retry_poll_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
+{
+    (void)loop;
+    (void)events;
+
+    rpc_proxy_t *proxy = (rpc_proxy_t *)data;
+
+    /* Acknowledge the timerfd expiration (mandatory for timerfd) */
+    uint64_t expirations = 0;
+    ssize_t r = read(fd, &expirations, sizeof(expirations));
+    (void)r;
+
+    /* Guard: only activate when in RACE_RETRY_WAIT state */
+    if (proxy->state != RACE_RETRY_WAIT) {
+        return;
+    }
+
+    /* Scan upstreams for any node in CONN_CONNECTED state */
+    bool found_connected = false;
+    for (int i = 0; i < proxy->upstream_count; i++) {
+        if (proxy->upstreams[i].state == CONN_CONNECTED) {
+            found_connected = true;
+            break;
+        }
+    }
+
+    if (found_connected) {
+        /* Cancel both retry timers */
+        if (proxy->retry_timer_fd >= 0) {
+            event_loop_del_fd(proxy->loop, proxy->retry_timer_fd);
+            close(proxy->retry_timer_fd);
+            proxy->retry_timer_fd = -1;
+        }
+        if (proxy->retry_deadline_timer_fd >= 0) {
+            event_loop_del_fd(proxy->loop, proxy->retry_deadline_timer_fd);
+            close(proxy->retry_deadline_timer_fd);
+            proxy->retry_deadline_timer_fd = -1;
+        }
+
+        /* Re-dispatch the GBT request to all connected nodes */
+        int sent = dispatch_fanout(proxy);
+
+        if (sent > 0) {
+            /* Success: transition to RACE_FANOUT, arm RPC timeout */
+            proxy->state = RACE_FANOUT;
+            start_rpc_timeout(proxy);
+            proxy->retry_attempts++;
+
+            log_msg(LOG_INFO, "[rpc_proxy] Retry poll: re-dispatched GBT to "
+                    "%d node(s) (attempt=%d)", sent, proxy->retry_attempts);
+        } else {
+            /* Node disconnected between check and send — re-arm retry timer,
+             * remain in RACE_RETRY_WAIT. Re-arm both timers since they were
+             * cancelled above. */
+            log_msg(LOG_DEBUG, "[rpc_proxy] Retry poll: node disconnected "
+                    "between check and dispatch, re-arming timers");
+
+            /* Re-arm the 100ms poll timer */
+            int poll_fd = timerfd_create(CLOCK_MONOTONIC,
+                                         TFD_NONBLOCK | TFD_CLOEXEC);
+            if (poll_fd < 0) {
+                log_msg(LOG_WARN, "[rpc_proxy] timerfd_create for retry "
+                        "re-arm failed: %s — sending error", strerror(errno));
+                send_rpc_error_to_client(proxy, -1,
+                    "All upstream nodes unreachable");
+                race_complete(proxy);
+                return;
+            }
+
+            struct itimerspec its = {0};
+            its.it_value.tv_nsec = 100000000L;  /* 100ms */
+
+            if (timerfd_settime(poll_fd, 0, &its, NULL) < 0 ||
+                event_loop_add_fd(proxy->loop, poll_fd, EPOLLIN,
+                                  retry_poll_cb, proxy) < 0) {
+                log_msg(LOG_WARN, "[rpc_proxy] retry poll re-arm failed — "
+                        "sending error");
+                close(poll_fd);
+                send_rpc_error_to_client(proxy, -1,
+                    "All upstream nodes unreachable");
+                race_complete(proxy);
+                return;
+            }
+            proxy->retry_timer_fd = poll_fd;
+
+            /* Re-arm the deadline timer with full timeout (conservative:
+             * avoids needing to track remaining time) */
+            int deadline_fd = timerfd_create(CLOCK_MONOTONIC,
+                                             TFD_NONBLOCK | TFD_CLOEXEC);
+            if (deadline_fd < 0) {
+                log_msg(LOG_WARN, "[rpc_proxy] timerfd_create for deadline "
+                        "re-arm failed: %s", strerror(errno));
+                /* Continue with just the poll timer; eventual reconnect or
+                 * external timeout will clean up */
+                return;
+            }
+
+            uint32_t deadline_ms = proxy->cfg->gbt_retry_timeout_ms;
+            struct itimerspec dits = {0};
+            dits.it_value.tv_sec = (time_t)(deadline_ms / 1000);
+            dits.it_value.tv_nsec = (long)((deadline_ms % 1000) * 1000000);
+
+            if (timerfd_settime(deadline_fd, 0, &dits, NULL) < 0 ||
+                event_loop_add_fd(proxy->loop, deadline_fd, EPOLLIN,
+                                  retry_deadline_cb, proxy) < 0) {
+                log_msg(LOG_WARN, "[rpc_proxy] deadline re-arm failed");
+                close(deadline_fd);
+                return;
+            }
+            proxy->retry_deadline_timer_fd = deadline_fd;
+
+            /* Remain in RACE_RETRY_WAIT */
+        }
+    } else {
+        /* No node connected yet — re-arm the 100ms poll timer */
+        struct itimerspec its = {0};
+        its.it_value.tv_nsec = 100000000L;  /* 100ms */
+        timerfd_settime(proxy->retry_timer_fd, 0, &its, NULL);
+    }
+}
+
+/* Retry deadline callback: fired when gbt_retry_timeout_ms expires.
+ * Cancels the retry poll timer, sends an error to the client, and
+ * transitions to RACE_IDLE via race_complete. */
+static void
+retry_deadline_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
+{
+    (void)loop;
+    (void)events;
+
+    rpc_proxy_t *proxy = (rpc_proxy_t *)data;
+
+    /* Acknowledge the timerfd expiration */
+    uint64_t expirations = 0;
+    ssize_t r = read(fd, &expirations, sizeof(expirations));
+    (void)r;
+
+    /* Cancel the retry poll timer */
+    if (proxy->retry_timer_fd >= 0) {
+        event_loop_del_fd(proxy->loop, proxy->retry_timer_fd);
+        close(proxy->retry_timer_fd);
+        proxy->retry_timer_fd = -1;
+    }
+
+    /* Clean up the deadline timer itself */
+    if (proxy->retry_deadline_timer_fd >= 0) {
+        event_loop_del_fd(proxy->loop, proxy->retry_deadline_timer_fd);
+        close(proxy->retry_deadline_timer_fd);
+        proxy->retry_deadline_timer_fd = -1;
+    }
+
+    log_msg(LOG_CRIT,
+            "[rpc_proxy] GBT retry timeout expired after %u ms, %d attempts",
+            proxy->cfg->gbt_retry_timeout_ms, proxy->retry_attempts);
+
+    send_rpc_error_to_client(proxy, -1,
+        "All upstream nodes unreachable after retry timeout");
+    race_complete(proxy);
+}
+
 /* Timeout callback: fires when the race exceeds rpc_timeout_ms. */
 static void
 rpc_timeout_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
@@ -1256,11 +1557,22 @@ on_upstream_response(upstream_conn_t *conn, void *data)
             proxy->winner_idx = node_idx;
 
             /* Req 9.6: Log race winner */
-            log_msg(LOG_INFO, "[%s] %s: method=%s elapsed_us=%llu",
-                    conn->config->label,
-                    (proxy->state == RACE_STICKY) ? "Sticky response" : "Race winner",
-                    proxy->method,
-                    (unsigned long long)elapsed_us);
+            if (proxy->state == RACE_STICKY &&
+                strcmp(proxy->method, METHOD_GBT) == 0) {
+                uint32_t tx_count = parse_gbt_tx_count(conn);
+                log_msg(LOG_INFO, "[%s] Sticky response: method=%s "
+                        "elapsed_us=%llu tx_count=%u",
+                        conn->config->label, proxy->method,
+                        (unsigned long long)elapsed_us,
+                        (unsigned)tx_count);
+            } else {
+                log_msg(LOG_INFO, "[%s] %s: method=%s elapsed_us=%llu",
+                        conn->config->label,
+                        (proxy->state == RACE_STICKY) ? "Sticky response"
+                                                      : "Race winner",
+                        proxy->method,
+                        (unsigned long long)elapsed_us);
+            }
 
             /* Req 9.8: Log additional detail for submitblock */
             if (strcmp(proxy->method, METHOD_SUBMITBLOCK) == 0) {
@@ -1410,7 +1722,17 @@ on_upstream_error(upstream_conn_t *conn, void *data)
     /* Check if race is over */
     if (proxy->responses_pending <= 0) {
         if (proxy->winner_idx == -1) {
-            /* All nodes failed — Req 13.3: return error immediately */
+            /* All nodes failed — check if this is a post-notify GBT that
+             * should enter retry wait instead of immediate error */
+            if (proxy->is_post_notify_gbt &&
+                strcmp(proxy->method, METHOD_GBT) == 0 &&
+                enter_retry_wait(proxy)) {
+                /* Retry wait entered successfully */
+                return;
+            }
+
+            /* Non-GBT, non-post-notify, or retry disabled:
+             * Req 13.3: return error immediately */
             log_msg(LOG_CRIT, "[rpc_proxy] All nodes failed for method=%s",
                     proxy->method);
             send_rpc_error_to_client(proxy, -1,
@@ -1506,6 +1828,10 @@ rpc_proxy_create(event_loop_t *loop, config_t *cfg)
     proxy->method[0] = '\0';
     proxy->stats = NULL;
     proxy->rpc_timeout_timer_fd = -1;
+    proxy->retry_timer_fd = -1;
+    proxy->retry_deadline_timer_fd = -1;
+    proxy->retry_attempts = 0;
+    proxy->is_post_notify_gbt = false;
 
     /* Initialize upstream connections */
     proxy->upstream_count = cfg->node_count;
@@ -1560,6 +1886,18 @@ rpc_proxy_destroy(rpc_proxy_t *proxy)
     /* Cancel any active timeout timer */
     cancel_rpc_timeout(proxy);
 
+    /* Clean up retry timers if active */
+    if (proxy->retry_timer_fd >= 0) {
+        event_loop_del_fd(proxy->loop, proxy->retry_timer_fd);
+        close(proxy->retry_timer_fd);
+        proxy->retry_timer_fd = -1;
+    }
+    if (proxy->retry_deadline_timer_fd >= 0) {
+        event_loop_del_fd(proxy->loop, proxy->retry_deadline_timer_fd);
+        close(proxy->retry_deadline_timer_fd);
+        proxy->retry_deadline_timer_fd = -1;
+    }
+
     /* Close client connection */
     if (proxy->client_connected)
         close_client(proxy);
@@ -1606,7 +1944,14 @@ rpc_proxy_on_block_notify(rpc_proxy_t *proxy, const uint8_t *hash)
      *
      * Transitioning to IDLE while a sticky request is in-flight would orphan
      * the response (drain path discards it), leaving the client with no
-     * response until its own timeout fires (e.g., 60s). */
+     * response until its own timeout fires (e.g., 60s).
+     *
+     * INTENTIONAL: Do NOT cancel retry timers or abort RACE_RETRY_WAIT here.
+     * If a post-notify GBT retry is in progress, the retry is for THIS block's
+     * GBT. When the retry succeeds and re-dispatches, the response will be for
+     * the current (latest) block. Sticky clearing above ensures the next GBT
+     * after the retry completes will race again if another notify arrives.
+     * (Req 3.6: Block notify during retry does not abort the retry.) */
 
     log_msg(LOG_INFO, "[rpc_proxy] Block notify received — sticky cleared, "
             "next GBT will race");

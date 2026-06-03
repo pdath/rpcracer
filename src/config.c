@@ -304,6 +304,23 @@ config_load(const char *path)
                     &cfg->stall_threshold_ms, "stall_threshold_ms") != 0)
         goto fail;
 
+    /* gbt_retry_timeout_ms (optional, default 5000, range 0-30000) */
+    yyjson_val *gbt_retry_val = yyjson_obj_get(root, "gbt_retry_timeout_ms");
+    if (gbt_retry_val && yyjson_is_int(gbt_retry_val)) {
+        int64_t v = yyjson_get_sint(gbt_retry_val);
+        if (v < 0 || v > 30000) {
+            log_msg(LOG_CRIT, "[config] Field 'gbt_retry_timeout_ms' out of range: %lld (need 0-30000)",
+                    (long long)v);
+            goto fail;
+        }
+        cfg->gbt_retry_timeout_ms = (uint32_t)v;
+    } else if (gbt_retry_val) {
+        log_msg(LOG_CRIT, "[config] Field 'gbt_retry_timeout_ms' must be an integer");
+        goto fail;
+    } else {
+        cfg->gbt_retry_timeout_ms = 5000;  /* default: 5 seconds */
+    }
+
     /* log_verbosity (required) */
     yyjson_val *verb_val = yyjson_obj_get(root, "log_verbosity");
     if (!verb_val || !yyjson_is_int(verb_val)) {
