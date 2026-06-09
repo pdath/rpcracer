@@ -64,8 +64,6 @@ test_valid_full_config(void)
         "  \"zmq_server_port\": 28332,\n"
         "  \"notify_http_url\": \"http://127.0.0.1:7152/NOTIFY/%s\",\n"
         "  \"rpc_timeout_ms\": 30000,\n"
-        "  \"reconnect_delay_ms\": 1000,\n"
-        "  \"stall_threshold_ms\": 60000,\n"
         "  \"log_verbosity\": 2\n"
         "}\n";
 
@@ -94,8 +92,6 @@ test_valid_full_config(void)
     ASSERT(cfg->zmq_server_port == 28332, "zmq_server_port");
     ASSERT(strcmp(cfg->notify_http_url, "http://127.0.0.1:7152/NOTIFY/%s") == 0, "notify_http_url");
     ASSERT(cfg->rpc_timeout_ms == 30000, "rpc_timeout_ms");
-    ASSERT(cfg->reconnect_delay_ms == 1000, "reconnect_delay_ms");
-    ASSERT(cfg->stall_threshold_ms == 60000, "stall_threshold_ms");
     ASSERT(cfg->log_verbosity == 2, "log_verbosity");
 
     config_destroy(cfg);
@@ -118,8 +114,6 @@ test_minimal_config(void)
         "  \"http_server_bind\": \"0.0.0.0\",\n"
         "  \"http_server_port\": 7152,\n"
         "  \"rpc_timeout_ms\": 5000,\n"
-        "  \"reconnect_delay_ms\": 500,\n"
-        "  \"stall_threshold_ms\": 30000,\n"
         "  \"log_verbosity\": 0\n"
         "}\n";
 
@@ -151,8 +145,6 @@ test_empty_nodes_array(void)
         "  \"http_server_bind\": \"0.0.0.0\",\n"
         "  \"http_server_port\": 7152,\n"
         "  \"rpc_timeout_ms\": 5000,\n"
-        "  \"reconnect_delay_ms\": 500,\n"
-        "  \"stall_threshold_ms\": 30000,\n"
         "  \"log_verbosity\": 2\n"
         "}\n";
 
@@ -179,8 +171,6 @@ test_duplicate_labels(void)
         "  \"http_server_bind\": \"0.0.0.0\",\n"
         "  \"http_server_port\": 7152,\n"
         "  \"rpc_timeout_ms\": 5000,\n"
-        "  \"reconnect_delay_ms\": 500,\n"
-        "  \"stall_threshold_ms\": 30000,\n"
         "  \"log_verbosity\": 2\n"
         "}\n";
 
@@ -206,8 +196,6 @@ test_zero_port(void)
         "  \"http_server_bind\": \"0.0.0.0\",\n"
         "  \"http_server_port\": 7152,\n"
         "  \"rpc_timeout_ms\": 5000,\n"
-        "  \"reconnect_delay_ms\": 500,\n"
-        "  \"stall_threshold_ms\": 30000,\n"
         "  \"log_verbosity\": 2\n"
         "}\n";
 
@@ -233,8 +221,6 @@ test_zero_timeout(void)
         "  \"http_server_bind\": \"0.0.0.0\",\n"
         "  \"http_server_port\": 7152,\n"
         "  \"rpc_timeout_ms\": 0,\n"
-        "  \"reconnect_delay_ms\": 500,\n"
-        "  \"stall_threshold_ms\": 30000,\n"
         "  \"log_verbosity\": 2\n"
         "}\n";
 
@@ -299,8 +285,6 @@ test_invalid_verbosity(void)
         "  \"http_server_bind\": \"0.0.0.0\",\n"
         "  \"http_server_port\": 7152,\n"
         "  \"rpc_timeout_ms\": 5000,\n"
-        "  \"reconnect_delay_ms\": 500,\n"
-        "  \"stall_threshold_ms\": 30000,\n"
         "  \"log_verbosity\": 5\n"
         "}\n";
 
@@ -329,8 +313,8 @@ test_too_many_nodes(void)
                     "],\n"
                     "\"rpc_server_bind\": \"127.0.0.1\", \"rpc_server_port\": 8332,\n"
                     "\"http_server_bind\": \"0.0.0.0\", \"http_server_port\": 7152,\n"
-                    "\"rpc_timeout_ms\": 5000, \"reconnect_delay_ms\": 500,\n"
-                    "\"stall_threshold_ms\": 30000, \"log_verbosity\": 2 }\n");
+                    "\"rpc_timeout_ms\": 5000,\n"
+                    "\"log_verbosity\": 2 }\n");
     (void)off;
 
     write_tmp_config(json);
@@ -368,8 +352,8 @@ test_max_nodes(void)
                     "],\n"
                     "\"rpc_server_bind\": \"127.0.0.1\", \"rpc_server_port\": 8332,\n"
                     "\"http_server_bind\": \"0.0.0.0\", \"http_server_port\": 7152,\n"
-                    "\"rpc_timeout_ms\": 5000, \"reconnect_delay_ms\": 500,\n"
-                    "\"stall_threshold_ms\": 30000, \"log_verbosity\": 2 }\n");
+                    "\"rpc_timeout_ms\": 5000,\n"
+                    "\"log_verbosity\": 2 }\n");
     (void)off;
 
     write_tmp_config(json);

@@ -41,8 +41,7 @@ typedef enum {
     CONN_CONNECTING,
     CONN_CONNECTED,
     CONN_SENDING,
-    CONN_RECEIVING,
-    CONN_DEAD
+    CONN_RECEIVING
 } conn_state_t;
 
 /* Simulated upstream connection */

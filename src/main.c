@@ -14,6 +14,8 @@
 #include "stats.h"
 #include "watchdog.h"
 
+#define STALL_THRESHOLD_MS 60000
+
 /* Global event loop pointer for signal handler access */
 static event_loop_t *g_loop = NULL;
 
@@ -61,11 +63,9 @@ main(int argc, char *argv[])
     }
     g_loop = loop;
 
-    /* Enable stall detection */
-    if (cfg->stall_threshold_ms > 0) {
-        if (event_loop_enable_stall_detection(loop, cfg->stall_threshold_ms) < 0) {
-            log_msg(LOG_WARN, "[main] failed to enable stall detection");
-        }
+    /* Enable stall detection (hardcoded 60s threshold) */
+    if (event_loop_enable_stall_detection(loop, STALL_THRESHOLD_MS) < 0) {
+        log_msg(LOG_WARN, "[main] failed to enable stall detection");
     }
 
     /* Create RPC proxy (binds listener immediately — Req 14.1) */

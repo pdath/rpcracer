@@ -16,12 +16,8 @@ typedef enum {
     CONN_CONNECTING,
     CONN_CONNECTED,
     CONN_SENDING,
-    CONN_RECEIVING,
-    CONN_DEAD           /* unreachable after 4+ consecutive reconnect failures */
+    CONN_RECEIVING
 } conn_state_t;
-
-/* Number of consecutive reconnect failures before declaring CONN_DEAD */
-#define RECONNECT_DEAD_THRESHOLD 4
 
 /* Forward declaration */
 typedef struct upstream_conn upstream_conn_t;
@@ -69,11 +65,6 @@ struct upstream_conn {
     /* Timing */
     uint64_t request_start_ns;  /* CLOCK_MONOTONIC nanoseconds */
 
-    /* Reconnection */
-    int reconnect_attempts;
-    uint64_t next_reconnect_ns;
-    uint32_t reconnect_base_ms; /* from config: reconnect_delay_ms */
-
     /* Callbacks */
     conn_callbacks_t cb;
 };
@@ -83,7 +74,6 @@ struct upstream_conn {
  * Returns 0 on success, -1 on allocation failure. */
 int rpc_conn_init(upstream_conn_t *conn, event_loop_t *loop,
                   node_config_t *config, int node_index,
-                  uint32_t reconnect_delay_ms,
                   const conn_callbacks_t *callbacks);
 
 /* Start a non-blocking connect to the upstream node.
@@ -109,17 +99,9 @@ int rpc_conn_get_response(const upstream_conn_t *conn,
  * Safe to call in any state. */
 void rpc_conn_disconnect(upstream_conn_t *conn);
 
-/* Schedule a reconnection attempt using exponential backoff.
- * Sets next_reconnect_ns based on current attempt count. */
-void rpc_conn_schedule_reconnect(upstream_conn_t *conn);
-
-/* Check if it's time to reconnect and initiate if so.
- * Called periodically by the proxy's timer. Returns 1 if reconnect started. */
-int rpc_conn_try_reconnect(upstream_conn_t *conn);
-
 /* Reset the connection after a race completes.
  * Clears send_buf pointer, resets recv state.
- * If connection_close was set, disconnects and schedules reconnect.
+ * If connection_close was set, disconnects only (no reconnect scheduling).
  * Otherwise transitions back to CONNECTED. */
 void rpc_conn_reset(upstream_conn_t *conn);
 

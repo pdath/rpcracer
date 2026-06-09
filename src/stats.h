@@ -31,7 +31,7 @@ void stats_record_notify_win(stats_t *s, int node_idx);
 /* Record notify-to-GBT latency. */
 void stats_record_notify_to_gbt(stats_t *s, uint64_t elapsed_us);
 
-/* Record an RPC request. Increments total_requests. */
+/* Record an RPC request. Increments total_rpc_requests. */
 void stats_record_request(stats_t *s);
 
 /* Record the timestamp of a block notification. */

@@ -302,20 +302,39 @@ typedef struct {
     /* ZMQ publisher socket (for downstream relay) */
     void *zmq_pub;
 
+    /* ZMQ PUB sequence counter (monotonically increasing, 4-byte LE) */
+    uint32_t zmq_pub_seq;
+
     /* Deduplication — stored as 32 bytes in display/RPC byte order (as received from ZMQ) */
     uint8_t last_hash[32];
     bool has_last_hash;
 
     /* Downstream relay config */
     int notify_http_fd;             /* non-blocking TCP socket for HTTP notify */
-    conn_state_t notify_http_state; /* connection state for HTTP notify socket */
+    int notify_http_state;          /* connection state for HTTP notify socket */
+
+    /* Silence detection: per-node tracking */
+    int node_map[MAX_NODES];        /* zmq_sub index → config node index */
+    uint8_t node_last_hash[MAX_NODES][32]; /* per-node: last reported hash */
+    bool node_has_hash[MAX_NODES];  /* per-node: has reported at least one hash */
+    uint64_t node_hash_changed_ns[MAX_NODES]; /* per-node: last hash change time */
+    uint64_t first_notify_ns;       /* timestamp of first notify for current block */
+    bool silence_warned[MAX_NODES]; /* already warned for current block event? */
+    int total_notify_sources;       /* number of nodes with ZMQ or HTTP notify */
+
+    /* Grace period: suppress notifies from non-winning nodes for 10s */
+    bool grace_active;
+    uint64_t grace_start_ns;
+    int grace_winner_node_idx;      /* config node index of winning notify node */
 
     /* Callback */
     notify_cb on_notify;
     void *cb_data;
 
-    /* Reference to config (owns notify_http_url, zmq_server_bind/port) */
+    /* Reference to config and optional pointers */
     config_t *cfg;
+    stats_t *stats;
+    struct rpc_proxy *proxy;        /* for IBD state checks */
 } notifier_t;
 ```
 
@@ -384,19 +403,27 @@ stateDiagram-v2
 ```mermaid
 sequenceDiagram
     participant BN1 as Bitcoin Node 1 (ZMQ)
-    participant BN2 as Bitcoin Node 2 (HTTP)
+    participant BN2 as Bitcoin Node 2 (ZMQ)
     participant NP as Notifier Proxy
     participant RP as RPC Proxy
     participant SP as Stratum Proxy
 
     BN1->>NP: ZMQ "hashblock" 0xABCD...
-    NP->>NP: Store last_hash = 0xABCD...
+    NP->>NP: Deduplicate → new hash
+    NP->>NP: Grace check → not active, accept
+    NP->>NP: Store last_hash, start 10s grace (winner=BN1)
     NP->>RP: on_block_notify(0xABCD...)
     RP->>RP: Set notify_pending = true, clear sticky
     NP->>SP: ZMQ PUB "hashblock" 0xABCD...
-    BN2->>NP: HTTP GET /NOTIFY/ABCD...
-    NP->>NP: Compare with last_hash → duplicate, suppress
-    NP-->>BN2: HTTP 200 OK
+    BN2->>NP: ZMQ "hashblock" 0xSTALE... (different, stale)
+    NP->>NP: Deduplicate → new hash
+    NP->>NP: Grace check → active, source≠winner → suppress
+    NP->>NP: Update node_hash_changed_ns (pipeline alive)
+    NP->>SP: ZMQ PUB relay 0xSTALE... (relay only)
+    Note over NP: No callback, no GBT race
+    BN2->>NP: ZMQ "hashblock" 0xABCD...
+    NP->>NP: Deduplicate → duplicate of last_hash → suppress
+    NP-->>BN2: (no action)
 ```
 
 **ZMQ Integration with epoll**: libzmq sockets expose a file descriptor via `zmq_getsockopt(ZMQ_FD)`. This fd is registered with epoll for `EPOLLIN`. When epoll signals readability, the callback checks `zmq_getsockopt(ZMQ_EVENTS)` for `ZMQ_POLLIN` and then calls `zmq_recv()` in a loop until no more messages are available (edge-triggered style).
@@ -405,7 +432,9 @@ sequenceDiagram
 
 **ZMQ Reconnection**: libzmq handles reconnection internally for SUB sockets. The notifier does not need to manually reconnect — libzmq's built-in reconnect handles TCP drops and node restarts.
 
-**Notification Silence Detection**: When a new unique block hash is received from any source, the notifier records the timestamp and which node reported it. A recurring 10-second timer checks whether other ZMQ-configured nodes have also reported the same block. If 60 seconds elapse after the first notification and a node has not reported the block, a warning is logged identifying the silent node. This detects broken ZMQ subscriptions or unreachable nodes without false positives during long block intervals (since the check is relative to another node's notification, not absolute time). Each node is warned at most once per block hash. The timer is only active when 2+ notification sources are configured.
+**Notification Silence Detection**: The notifier monitors each ZMQ-configured node's notification pipeline for liveness. Per-node state tracks the last block hash each node reported (`node_last_hash[i]`) and the monotonic timestamp when that hash last changed (`node_hash_changed_ns[i]`). A recurring 10-second timer compares each node's `node_hash_changed_ns` against `first_notify_ns` (the timestamp of the current block event). If 60 seconds elapse and a node's hash has not changed since before the block event, a warning is logged. Nodes that report any hash — even stale hashes suppressed by the grace period — have their `node_hash_changed_ns` updated and are considered alive. Nodes in IBD are excluded. Each node is warned at most once per block event (`silence_warned[i]` flag, reset when a new block is accepted). The timer is only active when 2+ notification sources are configured.
+
+**Notify Grace Period**: After accepting a new block notification (invoking the callback), the notifier enters a 10-second grace period. During this window, notifications from nodes other than the "winning notify node" (the node that triggered the accepted notification) carrying a different hash are suppressed — logged as suppressed, relayed downstream via ZMQ PUB and HTTP, but the proxy callback is not invoked and no GBT race is triggered. This prevents stale/late notifications from remote nodes from causing unnecessary duplicate races. The exception: if the winning notify node itself reports a new different hash during the grace period, it is treated as a legitimate fast block — the notification is accepted, the callback fires, and the grace period resets. Global state (`last_hash`, `first_notify_ns`) is only updated for accepted notifications, ensuring suppressed hashes do not corrupt dedup or silence detection state.
 
 **Downstream Relay**:
 - **ZMQ PUB**: If configured, a ZMQ PUB socket is bound and the block hash is published as a multipart message matching Bitcoin Core's format: topic "hashblock" (9 bytes), body (32-byte hash in display order), and a 4-byte little-endian sequence number. The notifier maintains its own monotonically increasing sequence counter, incremented on each publish.
@@ -730,6 +759,24 @@ LIBS = -lzmq -lpthread
 *For any* HTTP Basic Authentication header value in an incoming stratum proxy request, the upstream request to each Bitcoin node shall contain the identical Authorization header without modification.
 
 **Validates: Requirements 12.7**
+
+### Property 17: Notify Grace Period Suppression
+
+*For any* sequence of block notifications where the first notification from node A is accepted, all subsequent notifications from other nodes carrying a different block hash that arrive within 10 seconds shall be suppressed (not triggering a callback) but still relayed downstream. A notification from node A with a different hash during the grace period shall be accepted and reset the grace period.
+
+**Validates: Requirements 1.6, 1.7, 1.8**
+
+### Property 18: Notification Pipeline Liveness
+
+*For any* ZMQ-configured node that reports at least one hash (whether accepted, deduplicated, or grace-suppressed) that differs from its own previously reported hash since the most recent accepted block event, that node shall not trigger a silence warning. Only nodes whose last reported hash has not changed since before the block event shall be warned after 60 seconds.
+
+**Validates: Requirements 22.2, 22.3, 22.4**
+
+### Property 19: Initial Connect Logging
+
+*For any* connection pair, the "available" log message shall be emitted exactly once — on the first successful connection of either slot after initialization. Subsequent recovery events (standby swap when active is down) shall emit "recovered" instead.
+
+**Validates: Requirements 23.1, 23.2, 23.3**
 
 ## Error Handling
 

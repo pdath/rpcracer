@@ -26,9 +26,12 @@ rpcrace is a high-performance RPC proxy and block notification relay written in 
 
 1. THE Notifier_Proxy SHALL subscribe to the ZMQ "hashblock" topic on each Bitcoin_Node configured with a ZMQ endpoint.
 2. WHEN a Bitcoin_Node publishes a ZMQ "hashblock" message, THE Notifier_Proxy SHALL receive and process the message.
-3. WHEN a subsequent block notification is received from any Bitcoin_Node, via either ZMQ or HTTP, that has the same block hash as the prior notification, THE Notifier_Proxy SHALL suppress the duplicate without further processing.
+3. WHEN a subsequent block notification is received from any Bitcoin_Node, via either ZMQ or HTTP, that has the same block hash as the prior accepted notification, THE Notifier_Proxy SHALL suppress the duplicate without further processing.
 4. IF a ZMQ TCP connection to a Bitcoin_Node fails unexpectedly, THEN THE Notifier_Proxy SHALL attempt to reconnect and resume subscription without operator intervention.
 5. IF a Bitcoin_Node restarts, THEN THE Notifier_Proxy SHALL detect the disconnection and re-establish the ZMQ subscription.
+6. WHEN a block notification is accepted (callback invoked), THE Notifier_Proxy SHALL enter a 10-second grace period during which notifications from nodes other than the winning notify node carrying a different block hash SHALL be suppressed (not triggering a GBT race) but still relayed downstream.
+7. DURING the grace period, IF the winning notify node reports a new different block hash, THE Notifier_Proxy SHALL accept it as a legitimate new block, invoke the callback, and reset the grace period with the same winning node.
+8. WHEN the grace period expires (10 seconds elapsed), THE Notifier_Proxy SHALL resume accepting notifications from any node.
 
 ### Requirement 2: Block Notification Reception via HTTP
 
@@ -279,3 +282,27 @@ Example Bitcoin node configuration that triggers this endpoint:
 2. Each module SHALL expose functions to query or modify its internal state where cross-module interaction is needed.
 3. Inter-module communication SHALL occur through function calls defined in the module's public header file.
 4. Unit tests SHALL verify module behavior exclusively through the module's public API, not by accessing internal data structures.
+
+### Requirement 22: Notification Pipeline Liveness Detection
+
+**User Story:** As a system operator, I want rpcrace to detect when a node's ZMQ notification pipeline has stopped delivering new block hashes, so that I can investigate and fix broken subscriptions before they impact mining performance.
+
+#### Acceptance Criteria
+
+1. THE Notifier_Proxy SHALL monitor each ZMQ-configured Bitcoin_Node for notification pipeline liveness.
+2. WHEN a new block notification is accepted from any source, THE Notifier_Proxy SHALL start a 60-second silence detection window.
+3. IF a ZMQ-configured Bitcoin_Node does not report any new block hash (different from its own previously reported hash) within 60 seconds of the first accepted notification for the current block, THE Notifier_Proxy SHALL log a warning identifying the silent node.
+4. A node that reports any hash — including a stale hash that is suppressed by the grace period or deduplication — SHALL be considered alive and SHALL NOT trigger a silence warning.
+5. THE Notifier_Proxy SHALL warn each node at most once per block event.
+6. THE Notifier_Proxy SHALL NOT warn nodes that are in Initial Block Download (IBD) state, as they do not publish ZMQ notifications during sync.
+7. THE silence detection timer SHALL only be active when two or more notification sources are configured.
+
+### Requirement 23: Connection State Visibility
+
+**User Story:** As a system operator, I want clear log messages when nodes connect and recover, so that I can confirm all nodes are operational at startup and detect recovery events during operation.
+
+#### Acceptance Criteria
+
+1. WHEN a connection pair's first slot successfully connects for the first time after process startup, THE conn_pair module SHALL log an INFO message indicating the node is available.
+2. THE "available" message SHALL be logged exactly once per node at startup, regardless of which slot (active or standby) connects first.
+3. WHEN a connection pair recovers from a state where the active slot was down (standby swap to recover), THE conn_pair module SHALL log an INFO message indicating the node has recovered, distinguishing this from the initial startup connect.

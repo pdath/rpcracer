@@ -36,7 +36,7 @@ flowchart TB
     end
 
     SP -- "JSON-RPC<br/>127.0.0.1:9332" --> RR
-    RR -- "ZMQ notify" --> SP
+    RR -- "ZMQ/HTTP notify" --> SP
     RR -- "RPC + ZMQ<br/>127.0.0.1" --> BN1
     RR -- "RPC + ZMQ<br/>10.0.1.50" --> BN2
     RR -- "RPC + ZMQ<br/>203.0.113.10" --> BN3
@@ -166,8 +166,6 @@ rpcrace /etc/rpcrace/rpcrace.conf
     "notify_http_url": "http://127.0.0.1:7152/NOTIFY/%s",
 
     "rpc_timeout_ms": 30000,
-    "reconnect_delay_ms": 1000,
-    "stall_threshold_ms": 60000,
 
     "log_verbosity": 2
 }
@@ -188,8 +186,6 @@ rpcrace /etc/rpcrace/rpcrace.conf
 | `zmq_server_port` | ZMQ PUB port for downstream relay (optional, 0 or absent to disable) |
 | `notify_http_url` | HTTP GET URL template for downstream relay, `%s` is replaced by block hash (optional) |
 | `rpc_timeout_ms` | Global timeout for upstream RPC requests (ms) |
-| `reconnect_delay_ms` | Base delay before reconnecting to a failed node (doubles up to 30s) |
-| `stall_threshold_ms` | Event loop stall detection — process exits if no events for this long (ms) |
 | `log_verbosity` | 0=CRIT, 1=WARN, 2=INFO, 3=DEBUG |
 
 ### RPC authentication
@@ -243,8 +239,6 @@ ckpool receives block notifications via ZMQ.
     "zmq_server_port": 9331,
 
     "rpc_timeout_ms": 30000,
-    "reconnect_delay_ms": 1000,
-    "stall_threshold_ms": 60000,
 
     "log_verbosity": 2
 }
@@ -315,8 +309,6 @@ rpcrace uses HTTP to tell DATUM Gateway about new block notifications.
     "notify_http_url": "http://127.0.0.1:7152/NOTIFY",
 
     "rpc_timeout_ms": 30000,
-    "reconnect_delay_ms": 1000,
-    "stall_threshold_ms": 60000,
 
     "log_verbosity": 2
 }
@@ -393,6 +385,26 @@ Replace `rpcrace-host` with the IP or hostname where rpcrace is running. The `%s
 
 rpcrace deduplicates notifications automatically. If the same block hash arrives via both ZMQ and HTTP (or from multiple nodes), only the first occurrence triggers a relay to your stratum proxy.
 
+### Notify grace period
+
+When a block notification is accepted (deduplicated and triggers a GBT race), rpcrace enters a 10-second grace period. During this window, notifications from other nodes carrying a different block hash are suppressed — they are still relayed downstream via ZMQ PUB and HTTP, but do not trigger a new GBT race.
+
+This prevents stale or late notifications from remote nodes (which may briefly report an older block hash due to propagation timing) from causing unnecessary duplicate races.
+
+The one exception: if the node that originally won the notification reports a new different hash during the grace period, it is treated as a legitimate fast block and triggers a race immediately. This handles the rare case where two blocks are found in quick succession.
+
+### Silence detection
+
+rpcrace monitors each node's ZMQ notification pipeline for liveness. If a node does not report any new block hash (different from its own previous hash) within 60 seconds of another node reporting a new block, a warning is logged:
+
+```
+[WARN] [notifier] Node 'remote-node' did not report any new block within 60s (last accepted: 000000...)
+```
+
+This detects a dead or broken ZMQ subscription. Nodes that report any hash — even a stale one that gets suppressed by the grace period — are considered alive and will not trigger this warning. Only nodes with a completely silent pipeline are flagged.
+
+Nodes in IBD (Initial Block Download) are excluded from silence checks, as they do not publish ZMQ notifications during sync.
+
 ## OS Configuration
 
 These settings apply regardless of which stratum proxy you use. They ensure the kernel can handle the 4 MB socket buffers rpcrace allocates and reduce scheduling jitter.
@@ -414,7 +426,7 @@ sudo sysctl -p
 
 ### Kernel preemption model
 
-This configuration is for those wanting to optimise a machine for "mining first" operation.
+This configuration is for those wanting to optimise a machine for "mining first" operation.  The config in this section may not be available on some virtual machines.
 
 For lowest-latency event loop performance, use the `PREEMPT_NONE` kernel preemption model. This is the default on most server-oriented distributions (Ubuntu Server, Debian, Amazon Linux) but desktop kernels often ship with `PREEMPT_DYNAMIC` or `PREEMPT_VOLUNTARY`.
 
@@ -441,6 +453,22 @@ rpcrace /etc/rpcrace/rpcrace.conf
 ```
 
 Logs go to stderr with microsecond timestamps. In production, let your process supervisor capture stderr.
+
+### Startup log
+
+On startup, each upstream node logs `available` once its first connection is established:
+
+```
+[INFO] [main] rpcrace starting, config=rpcrace.conf
+[INFO] [rpc_proxy] Upstream pair[0] (local-node) → 127.0.0.1:8332
+[INFO] [rpc_proxy] Upstream pair[1] (remote-node) → 10.0.1.50:8332
+[INFO] [rpc_proxy] Listening on 127.0.0.1:9332
+[INFO] [main] entering event loop
+[INFO] [local-node] available
+[INFO] [remote-node] available
+```
+
+All nodes showing `available` confirms the proxy is fully operational. If a node drops and reconnects later, it logs `recovered` instead — distinguishing a restart-time connect from a mid-operation recovery.
 
 ### systemd
 
@@ -495,7 +523,7 @@ curl http://localhost:9333/stats
 ```json
 {
   "uptime_seconds": 86400,
-  "total_requests": 12045,
+  "total_rpc_requests": 12045,
   "total_gbt_races": 144,
   "last_notify_to_gbt_us": 48320,
   "nodes": [
@@ -534,7 +562,7 @@ curl http://localhost:9333/stats
 | Field | Description |
 |-------|-------------|
 | `uptime_seconds` | Seconds since rpcrace started |
-| `total_requests` | Total RPC requests proxied (all methods) |
+| `total_rpc_requests` | Total RPC requests proxied (all methods) |
 | `total_gbt_races` | Number of GBT races completed (one per block notification) |
 | `last_notify_to_gbt_us` | Microseconds from the last block notification to the winning GBT response |
 

@@ -99,10 +99,10 @@ verify_trial(int trial, stats_t *s, config_t *cfg, node_oracle_t *oracle,
     ASSERT_MSG(v != NULL && yyjson_is_uint(v),
                "trial %d: uptime_seconds missing or wrong type", trial);
 
-    v = yyjson_obj_get(root, "total_requests");
-    ASSERT_MSG(v != NULL, "trial %d: total_requests missing", trial);
+    v = yyjson_obj_get(root, "total_rpc_requests");
+    ASSERT_MSG(v != NULL, "trial %d: total_rpc_requests missing", trial);
     ASSERT_MSG(yyjson_get_uint(v) == total_requests,
-               "trial %d: total_requests expected %u got %llu",
+               "trial %d: total_rpc_requests expected %u got %llu",
                trial, total_requests, (unsigned long long)yyjson_get_uint(v));
 
     v = yyjson_obj_get(root, "total_gbt_races");

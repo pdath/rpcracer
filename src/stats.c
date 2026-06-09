@@ -28,7 +28,7 @@ struct stats {
     uint64_t last_notify_to_gbt_us; /* time from notify to winning GBT response */
     uint64_t last_notify_time_ns;   /* CLOCK_MONOTONIC timestamp of last notify */
     uint32_t total_races;           /* total number of GBT races */
-    uint32_t total_requests;        /* total RPC requests proxied */
+    uint32_t total_rpc_requests;        /* total RPC requests proxied */
 
     /* Uptime tracking */
     uint64_t start_time_ns;         /* CLOCK_MONOTONIC timestamp at init */
@@ -87,7 +87,7 @@ void stats_record_notify_to_gbt(stats_t *s, uint64_t elapsed_us)
 
 void stats_record_request(stats_t *s)
 {
-    s->total_requests++;
+    s->total_rpc_requests++;
 }
 
 void stats_record_notify_time(stats_t *s, uint64_t notify_time_ns)
@@ -128,7 +128,7 @@ int stats_serialize_json(char *buf, size_t cap, void *data)
 
     /* Top-level fields */
     yyjson_mut_obj_add_uint(doc, root, "uptime_seconds", uptime_s);
-    yyjson_mut_obj_add_uint(doc, root, "total_requests", s->total_requests);
+    yyjson_mut_obj_add_uint(doc, root, "total_rpc_requests", s->total_rpc_requests);
     yyjson_mut_obj_add_uint(doc, root, "total_gbt_races", s->total_races);
     yyjson_mut_obj_add_uint(doc, root, "last_notify_to_gbt_us",
                             s->last_notify_to_gbt_us);

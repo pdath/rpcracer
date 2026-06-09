@@ -4,6 +4,7 @@
 #define RPC_PROXY_H
 
 #include "config.h"
+#include "conn_pair.h"
 #include "event_loop.h"
 #include "stats.h"
 
@@ -32,8 +33,8 @@ void rpc_proxy_on_block_notify(rpc_proxy_t *proxy, const uint8_t *hash);
 
 /* Fill an array of state name strings for each upstream node.
  * Each entry points to a static string: "connected", "disconnected",
- * "connecting", "sending", "receiving", "dead", or "ibd".
- * count should be at least proxy->upstream_count. */
+ * "connecting", "sending", "receiving", or "ibd".
+ * count should be at least proxy->pair_count. */
 void rpc_proxy_get_states(rpc_proxy_t *proxy, const char **out, int count);
 
 /* Check if a node is in IBD (Initial Block Download) state.

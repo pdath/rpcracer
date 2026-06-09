@@ -15,9 +15,6 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
-/* Maximum reconnect backoff: 30 seconds */
-#define RECONNECT_MAX_MS 30000
-
 /* ---- internal helpers ---- */
 
 static void
@@ -124,7 +121,6 @@ conn_state_name(conn_state_t state)
     case CONN_CONNECTED:    return "CONNECTED";
     case CONN_SENDING:      return "SENDING";
     case CONN_RECEIVING:    return "RECEIVING";
-    case CONN_DEAD:         return "DEAD";
     default:                return "UNKNOWN";
     }
 }
@@ -155,7 +151,6 @@ conn_epoll_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
                 conn->cb.on_error(conn, conn->cb.data);
         }
 
-        rpc_conn_schedule_reconnect(conn);
         return;
     }
 
@@ -173,19 +168,16 @@ conn_epoll_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
                 close(conn->fd);
                 conn->fd = -1;
                 conn->state = CONN_DISCONNECTED;
-                rpc_conn_schedule_reconnect(conn);
                 return;
             }
 
             /* Connection established */
             conn->state = CONN_CONNECTED;
-            conn->reconnect_attempts = 0;
-            conn->next_reconnect_ns = 0;
 
             /* Switch to EPOLLIN for receiving; EPOLLOUT added when sending */
             event_loop_mod_fd(conn->loop, conn->fd, EPOLLIN);
 
-            log_msg(LOG_INFO, "[%s] Connected to %s:%u",
+            log_msg(LOG_DEBUG, "[%s] Connected to %s:%u",
                     conn->config->label,
                     conn->config->host,
                     conn->config->rpc_port);
@@ -214,7 +206,6 @@ conn_epoll_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
                 conn->state = CONN_DISCONNECTED;
                 if (conn->cb.on_error)
                     conn->cb.on_error(conn, conn->cb.data);
-                rpc_conn_schedule_reconnect(conn);
                 return;
             }
 
@@ -252,7 +243,6 @@ conn_epoll_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
                 conn->state = CONN_DISCONNECTED;
                 if (conn->cb.on_error)
                     conn->cb.on_error(conn, conn->cb.data);
-                rpc_conn_schedule_reconnect(conn);
                 return;
             }
 
@@ -271,7 +261,6 @@ conn_epoll_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
                 conn->state = CONN_DISCONNECTED;
                 if (conn->cb.on_error)
                     conn->cb.on_error(conn, conn->cb.data);
-                rpc_conn_schedule_reconnect(conn);
                 return;
             }
 
@@ -285,7 +274,6 @@ conn_epoll_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
                 conn->state = CONN_DISCONNECTED;
                 if (conn->cb.on_error)
                     conn->cb.on_error(conn, conn->cb.data);
-                rpc_conn_schedule_reconnect(conn);
                 return;
             }
 
@@ -312,13 +300,11 @@ conn_epoll_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
                 close(conn->fd);
                 conn->fd = -1;
                 conn->state = CONN_DISCONNECTED;
-                rpc_conn_schedule_reconnect(conn);
             }
         }
         break;
 
     case CONN_DISCONNECTED:
-    case CONN_DEAD:
         /* Should not receive events in this state */
         break;
     }
@@ -329,7 +315,6 @@ conn_epoll_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
 int
 rpc_conn_init(upstream_conn_t *conn, event_loop_t *loop,
               node_config_t *config, int node_index,
-              uint32_t reconnect_delay_ms,
               const conn_callbacks_t *callbacks)
 {
     if (!conn || !loop || !config)
@@ -359,9 +344,6 @@ rpc_conn_init(upstream_conn_t *conn, event_loop_t *loop,
     conn->connection_close = 0;
 
     conn->request_start_ns = 0;
-    conn->reconnect_attempts = 0;
-    conn->next_reconnect_ns = 0;
-    conn->reconnect_base_ms = reconnect_delay_ms;
 
     if (callbacks)
         conn->cb = *callbacks;
@@ -372,7 +354,7 @@ rpc_conn_init(upstream_conn_t *conn, event_loop_t *loop,
 int
 rpc_conn_connect(upstream_conn_t *conn)
 {
-    if (!conn || (conn->state != CONN_DISCONNECTED && conn->state != CONN_DEAD))
+    if (!conn || conn->state != CONN_DISCONNECTED)
         return -1;
 
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -409,8 +391,6 @@ rpc_conn_connect(upstream_conn_t *conn)
     if (ret == 0) {
         /* Immediate connection (e.g., localhost) */
         conn->state = CONN_CONNECTED;
-        conn->reconnect_attempts = 0;
-        conn->next_reconnect_ns = 0;
 
         if (event_loop_add_fd(conn->loop, fd, EPOLLIN,
                               conn_epoll_cb, conn) < 0) {
@@ -422,7 +402,7 @@ rpc_conn_connect(upstream_conn_t *conn)
             return -1;
         }
 
-        log_msg(LOG_INFO, "[%s] Connected to %s:%u (immediate)",
+        log_msg(LOG_DEBUG, "[%s] Connected to %s:%u (immediate)",
                 conn->config->label,
                 conn->config->host,
                 conn->config->rpc_port);
@@ -523,68 +503,6 @@ rpc_conn_disconnect(upstream_conn_t *conn)
 }
 
 void
-rpc_conn_schedule_reconnect(upstream_conn_t *conn)
-{
-    if (!conn)
-        return;
-
-    /* Exponential backoff: base * 2^attempts, capped at 30s */
-    uint64_t delay_ms = (uint64_t)conn->reconnect_base_ms;
-    for (int i = 0; i < conn->reconnect_attempts; i++) {
-        delay_ms *= 2;
-        if (delay_ms >= RECONNECT_MAX_MS) {
-            delay_ms = RECONNECT_MAX_MS;
-            break;
-        }
-    }
-
-    conn->reconnect_attempts++;
-    conn->next_reconnect_ns = clock_monotonic_ns() +
-                              delay_ms * 1000000ULL;
-
-    /* Transition to DEAD after threshold consecutive failures */
-    if (conn->reconnect_attempts >= RECONNECT_DEAD_THRESHOLD &&
-        conn->state == CONN_DISCONNECTED) {
-        conn->state = CONN_DEAD;
-        log_msg(LOG_WARN, "[%s] Node declared DEAD after %d consecutive "
-                "reconnect failures", conn->config->label,
-                conn->reconnect_attempts);
-    }
-
-    log_msg(LOG_DEBUG, "[%s] Reconnect scheduled in %llu ms (attempt %d)",
-            conn->config->label,
-            (unsigned long long)delay_ms,
-            conn->reconnect_attempts);
-}
-
-int
-rpc_conn_try_reconnect(upstream_conn_t *conn)
-{
-    if (!conn)
-        return 0;
-
-    if (conn->state != CONN_DISCONNECTED && conn->state != CONN_DEAD)
-        return 0;
-
-    if (conn->next_reconnect_ns == 0)
-        return 0;
-
-    uint64_t now = clock_monotonic_ns();
-    if (now < conn->next_reconnect_ns)
-        return 0;
-
-    /* Time to reconnect */
-    conn->next_reconnect_ns = 0;
-    if (rpc_conn_connect(conn) < 0) {
-        /* Connect failed immediately — schedule another attempt */
-        rpc_conn_schedule_reconnect(conn);
-        return 0;
-    }
-
-    return 1;
-}
-
-void
 rpc_conn_reset(upstream_conn_t *conn)
 {
     if (!conn)
@@ -603,12 +521,11 @@ rpc_conn_reset(upstream_conn_t *conn)
     conn->request_start_ns = 0;
 
     if (conn->connection_close) {
-        /* Server requested close — tear down and reconnect */
-        log_msg(LOG_INFO, "[%s] Server sent Connection: close, reconnecting",
+        /* Server requested close — disconnect only; rotation handles reconnect */
+        log_msg(LOG_INFO, "[%s] Server sent Connection: close, disconnecting",
                 conn->config->label);
         conn->connection_close = 0;
         rpc_conn_disconnect(conn);
-        rpc_conn_schedule_reconnect(conn);
     } else if (conn->state == CONN_RECEIVING || conn->state == CONN_SENDING) {
         /* Return to connected state */
         conn->state = CONN_CONNECTED;

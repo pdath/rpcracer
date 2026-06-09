@@ -190,7 +190,7 @@ static void test_stats_record_request(void)
     yyjson_doc *doc = yyjson_read(buf, (size_t)len, 0);
     assert(doc != NULL);
     yyjson_val *root = yyjson_doc_get_root(doc);
-    assert(yyjson_get_uint(yyjson_obj_get(root, "total_requests")) == 100);
+    assert(yyjson_get_uint(yyjson_obj_get(root, "total_rpc_requests")) == 100);
 
     yyjson_doc_free(doc);
     stats_destroy(s);

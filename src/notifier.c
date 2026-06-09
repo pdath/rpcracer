@@ -35,6 +35,10 @@
 /* How often to check for silent nodes (10 seconds) */
 #define SILENCE_CHECK_INTERVAL_MS 10000
 
+/* Grace period after accepting a new block notify: suppress notifies from
+ * non-winning nodes for this duration (10 seconds). */
+#define NOTIFY_GRACE_PERIOD_NS (10ULL * 1000000000ULL)
+
 /* Hex string buffer: 32 bytes * 2 + null */
 #define HEX_HASH_LEN 65
 
@@ -69,17 +73,28 @@ struct notifier {
 
     /* Silence detection: per-node tracking.
      * node_map[i] maps zmq_sub index i to the config node index.
-     * last_notify_ns[node_idx] = monotonic timestamp of last notification
-     * from that node (ZMQ or HTTP). */
+     * node_last_hash[node_idx] = last block hash reported by that node.
+     * node_hash_changed_ns[node_idx] = monotonic time when node last reported
+     *   a hash different from its previous one (i.e. pipeline activity).
+     * first_notify_ns = monotonic timestamp of first notify for current block. */
     int node_map[MAX_NODES];        /* zmq_sub index → config node index */
-    uint64_t last_notify_ns[MAX_NODES]; /* per config-node: last notify time */
-    uint64_t first_notify_ns;       /* timestamp of first notify for current hash */
-    bool silence_warned[MAX_NODES]; /* already warned for current hash? */
+    uint8_t node_last_hash[MAX_NODES][HASH_SIZE]; /* per-node: last reported hash */
+    bool node_has_hash[MAX_NODES];  /* per-node: has reported at least one hash */
+    uint64_t node_hash_changed_ns[MAX_NODES]; /* per-node: last hash change time */
+    uint64_t first_notify_ns;       /* timestamp of first notify for current block */
+    bool silence_warned[MAX_NODES]; /* already warned for current block event? */
     int total_notify_sources;       /* number of nodes with ZMQ or HTTP notify */
 
     /* Callback */
     notify_cb on_notify;
     void *cb_data;
+
+    /* Grace period: after accepting a new block notify, suppress notifies
+     * from other nodes for 10s. Only the winning notify node (the node that
+     * triggered the accepted notify) can break through the grace period. */
+    bool grace_active;
+    uint64_t grace_start_ns;
+    int grace_winner_node_idx;      /* config node index of winning notify node */
 
     /* References */
     event_loop_t *loop;
@@ -515,8 +530,10 @@ relay_http_notify(notifier_t *n, const uint8_t *hash)
 
 /* ---- silence detection timer callback ---- */
 
-/* Periodic timer callback: check if any notification sources have not
- * reported the current block within 60 seconds of the first notification. */
+/* Periodic timer callback: check if any notification sources have gone
+ * silent — i.e. have not reported any new (different) hash within 60 seconds
+ * of a block event. A node that reports *any* new hash (even a different one)
+ * is considered healthy. Only nodes whose pipeline appears dead are warned. */
 static void
 silence_check_cb(event_loop_t *loop, void *data)
 {
@@ -530,7 +547,7 @@ silence_check_cb(event_loop_t *loop, void *data)
     uint64_t now = clock_monotonic_ns();
     uint64_t elapsed = now - n->first_notify_ns;
 
-    /* Only check after 60 seconds have passed since first notify */
+    /* Only check after 60 seconds have passed since the block event */
     if (elapsed < SILENCE_THRESHOLD_NS)
         return;
 
@@ -545,19 +562,23 @@ silence_check_cb(event_loop_t *loop, void *data)
         if (n->proxy && rpc_proxy_is_node_ibd((rpc_proxy_t *)n->proxy, i))
             continue;
 
-        /* Already warned for this hash? */
+        /* Already warned for this block event? */
         if (n->silence_warned[i])
             continue;
 
-        /* Check if this node reported the current block */
-        if (n->last_notify_ns[i] >= n->first_notify_ns)
-            continue;  /* Node reported after the first notify — it's fine */
+        /* A node is healthy if it reported any new hash (different from its
+         * previous) since the block event. Check if node_hash_changed_ns
+         * is at or after the block event timestamp. */
+        if (n->node_has_hash[i] &&
+            n->node_hash_changed_ns[i] >= n->first_notify_ns)
+            continue;  /* Node reported something new — pipeline is alive */
 
-        /* This node hasn't reported the current block within 60s */
+        /* This node's pipeline appears dead — no new hash in 60s */
         char hex[HEX_HASH_LEN];
         hex_encode(n->last_hash, HASH_SIZE, hex);
-        log_msg(LOG_WARN, "[notifier] Node '%s' did not report block "
-                "%s within 60s", n->cfg->nodes[i].label, hex);
+        log_msg(LOG_WARN, "[notifier] Node '%s' did not report any new block "
+                "within 60s (last accepted: %s)",
+                n->cfg->nodes[i].label, hex);
         n->silence_warned[i] = true;
     }
 }
@@ -587,12 +608,17 @@ notifier_create(event_loop_t *loop, config_t *cfg, notify_cb cb, void *data)
     n->notify_http_configured = false;
     n->first_notify_ns = 0;
     n->total_notify_sources = 0;
+    n->grace_active = false;
+    n->grace_start_ns = 0;
+    n->grace_winner_node_idx = -1;
     n->stats = NULL;
     n->proxy = NULL;
 
     /* Initialize per-node silence tracking */
     for (int i = 0; i < MAX_NODES; i++) {
-        n->last_notify_ns[i] = 0;
+        memset(n->node_last_hash[i], 0, HASH_SIZE);
+        n->node_has_hash[i] = false;
+        n->node_hash_changed_ns[i] = 0;
         n->silence_warned[i] = false;
         n->node_map[i] = -1;
     }
@@ -805,7 +831,14 @@ notifier_process_hash(notifier_t *n, const uint8_t *hash,
         if (node_label) {
             for (int i = 0; i < n->cfg->node_count; i++) {
                 if (strcmp(n->cfg->nodes[i].label, node_label) == 0) {
-                    n->last_notify_ns[i] = now;
+                    /* If this hash differs from the node's previous hash,
+                     * update the change timestamp (pipeline is alive). */
+                    if (!n->node_has_hash[i] ||
+                        memcmp(n->node_last_hash[i], hash, HASH_SIZE) != 0) {
+                        n->node_hash_changed_ns[i] = now;
+                    }
+                    memcpy(n->node_last_hash[i], hash, HASH_SIZE);
+                    n->node_has_hash[i] = true;
                     break;
                 }
             }
@@ -813,26 +846,67 @@ notifier_process_hash(notifier_t *n, const uint8_t *hash,
         return 0;
     }
 
-    /* Store as last_hash */
-    memcpy(n->last_hash, hash, HASH_SIZE);
-    n->has_last_hash = true;
+    /* Store as last_hash (tentative — may be reverted if suppressed) */
+    /* We need the hash in last_hash for the duplicate check to work on
+     * subsequent messages, but first_notify_ns should only update on accept. */
 
-    /* Record timestamp of first notification for this new hash
-     * and reset per-node silence warnings */
+    /* Record timestamp for this event */
     uint64_t now = clock_monotonic_ns();
-    n->first_notify_ns = now;
-    for (int i = 0; i < MAX_NODES; i++) {
-        n->silence_warned[i] = false;
-    }
 
-    /* Mark the source node as having reported this block. */
+    /* Resolve the source node index and update per-node tracking.
+     * This happens regardless of grace suppression so that silence
+     * detection knows the node's pipeline is alive. */
+    int source_node_idx = -1;
     if (node_label) {
         for (int i = 0; i < n->cfg->node_count; i++) {
             if (strcmp(n->cfg->nodes[i].label, node_label) == 0) {
-                n->last_notify_ns[i] = now;
+                source_node_idx = i;
+                /* Update changed timestamp if hash differs from node's previous */
+                if (!n->node_has_hash[i] ||
+                    memcmp(n->node_last_hash[i], hash, HASH_SIZE) != 0) {
+                    n->node_hash_changed_ns[i] = now;
+                }
+                memcpy(n->node_last_hash[i], hash, HASH_SIZE);
+                n->node_has_hash[i] = true;
                 break;
             }
         }
+    }
+
+    /* Grace period check: if a recent notify was accepted, suppress notifies
+     * from nodes other than the winning notify node for 10 seconds.
+     * This prevents late/stale notifies from remote nodes triggering
+     * unnecessary GBT races. */
+    if (n->grace_active) {
+        uint64_t elapsed = now - n->grace_start_ns;
+        if (elapsed < NOTIFY_GRACE_PERIOD_NS &&
+            source_node_idx != n->grace_winner_node_idx) {
+            /* Suppressed — log and relay downstream but don't invoke callback.
+             * Do NOT update last_hash or first_notify_ns for suppressed events. */
+            char hex[HEX_HASH_LEN];
+            hex_encode(hash, HASH_SIZE, hex);
+            log_msg(LOG_INFO, "[notifier] [%s] Suppressed block notify from %s: "
+                    "%s (grace period, winning node: %s)",
+                    protocol ? protocol : "?",
+                    node_label ? node_label : "unknown", hex,
+                    n->grace_winner_node_idx >= 0
+                        ? n->cfg->nodes[n->grace_winner_node_idx].label
+                        : "unknown");
+
+            /* Still relay downstream (subscribers may want all notifications) */
+            relay_zmq_pub(n, hash);
+            relay_http_notify(n, hash);
+            return 0;
+        }
+        /* Grace period expired or winning node reported — fall through to accept */
+    }
+
+    /* Notification accepted — update global state */
+    memcpy(n->last_hash, hash, HASH_SIZE);
+    n->has_last_hash = true;
+    n->first_notify_ns = now;
+    for (int i = 0; i < MAX_NODES; i++) {
+        n->silence_warned[i] = false;
     }
 
     /* Log the new block notification (Req 9.5) */
@@ -842,14 +916,14 @@ notifier_process_hash(notifier_t *n, const uint8_t *hash,
             protocol ? protocol : "?",
             node_label ? node_label : "unknown", hex);
 
+    /* Start/reset grace period: this node is the new winning notify node */
+    n->grace_active = true;
+    n->grace_start_ns = now;
+    n->grace_winner_node_idx = source_node_idx;
+
     /* Record notify win in stats */
-    if (n->stats && node_label) {
-        for (int i = 0; i < n->cfg->node_count; i++) {
-            if (strcmp(n->cfg->nodes[i].label, node_label) == 0) {
-                stats_record_notify_win(n->stats, i);
-                break;
-            }
-        }
+    if (n->stats && source_node_idx >= 0) {
+        stats_record_notify_win(n->stats, source_node_idx);
     }
 
     /* Invoke callback */

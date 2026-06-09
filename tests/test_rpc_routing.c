@@ -1,16 +1,16 @@
-/* test_rpc_routing.c — Property test for RPC method routing (Property 2)
+/* Feature: conn-pair-refactor, Property 10: Method routing classification */
+/* test_rpc_routing.c — Property test for RPC method routing
  *
- * Property 2: RPC Method Routing Classification
- * For any RPC method name string, the routing decision shall be:
- *   getblocktemplate → race-then-sticky (ROUTE_RACE when notify_pending or no sticky)
- *   submitblock → broadcast-all (no abort)
- *   sendrawtransaction → broadcast-all (no abort)
- *   preciousblock → sticky-only
- *   all others → fan-out race
- * Method names not in the expected list shall additionally be logged as
- * unexpected but still use fan-out.
+ * Property 10: Method routing classification
+ * For any method string, classify_method() SHALL return:
+ *   ROUTE_RACE for "getblocktemplate" (when notify_pending or no sticky)
+ *   ROUTE_STICKY for "getblocktemplate" (subsequent, sticky exists)
+ *   ROUTE_BROADCAST for "submitblock" and "sendrawtransaction"
+ *   ROUTE_STICKY for "preciousblock"
+ *   ROUTE_RACE for "validateaddress" and "decoderawtransaction"
+ *   ROUTE_RACE for all other/unknown methods
  *
- * Validates: Requirements 4.1, 4.5, 5.1, 6.1, 7.1, 8.1
+ * Validates: Requirements 12.1
  *
  * Since classify_method() is static and operates on the internal rpc_proxy_t
  * struct, this test re-implements the routing logic independently based on the
@@ -46,29 +46,29 @@ typedef enum {
     ROUTE_STICKY        /* Send to sticky node only */
 } route_strategy_t;
 
-/* ---- Known method names (from the specification) ---- */
-static const char METHOD_GBT[]          = "getblocktemplate";
-static const char METHOD_SUBMITBLOCK[]  = "submitblock";
-static const char METHOD_SENDRAWTX[]    = "sendrawtransaction";
-static const char METHOD_PRECIOUSBLOCK[] = "preciousblock";
+/* ---- Known method names (from the specification / rpc_proxy.c) ---- */
+static const char METHOD_GBT[]              = "getblocktemplate";
+static const char METHOD_SUBMITBLOCK[]      = "submitblock";
+static const char METHOD_SENDRAWTX[]        = "sendrawtransaction";
+static const char METHOD_PRECIOUSBLOCK[]    = "preciousblock";
+static const char METHOD_VALIDATEADDRESS[]  = "validateaddress";
+static const char METHOD_DECODERAWTX[]      = "decoderawtransaction";
 
 /* ---- Reference implementation of routing classification ----
  *
  * This is an independent implementation based purely on the specification
- * table in the design document. It does NOT call into rpc_proxy.c.
+ * table in the design document and the actual classify_method logic. It does
+ * NOT call into rpc_proxy.c.
  *
- * For this property test, we focus on the method name → strategy mapping
- * in the "first GBT after notify" scenario (notify_pending=true or no sticky),
- * which is the baseline routing decision:
- *   - getblocktemplate → ROUTE_RACE (race-then-sticky)
+ * Routing rules:
+ *   - getblocktemplate → ROUTE_RACE (if notify_pending or no sticky)
+ *   - getblocktemplate → ROUTE_STICKY (if sticky exists and no notify_pending)
  *   - submitblock → ROUTE_BROADCAST
  *   - sendrawtransaction → ROUTE_BROADCAST
  *   - preciousblock → ROUTE_STICKY
+ *   - validateaddress → ROUTE_RACE
+ *   - decoderawtransaction → ROUTE_RACE
  *   - anything else → ROUTE_RACE (fan-out race)
- *
- * The distinction between GBT's "race-then-sticky" and the general "fan-out
- * race" is a runtime behavior (winner becomes sticky), not a routing strategy
- * difference — both use ROUTE_RACE. The property verifies the strategy enum.
  */
 static route_strategy_t
 spec_classify_method(const char *method, int sticky_node_idx, int notify_pending)
@@ -81,17 +81,20 @@ spec_classify_method(const char *method, int sticky_node_idx, int notify_pending
         return ROUTE_STICKY;
     }
 
-    if (strcmp(method, METHOD_SUBMITBLOCK) == 0) {
+    if (strcmp(method, METHOD_SUBMITBLOCK) == 0)
         return ROUTE_BROADCAST;
-    }
 
-    if (strcmp(method, METHOD_SENDRAWTX) == 0) {
+    if (strcmp(method, METHOD_SENDRAWTX) == 0)
         return ROUTE_BROADCAST;
-    }
 
-    if (strcmp(method, METHOD_PRECIOUSBLOCK) == 0) {
+    if (strcmp(method, METHOD_PRECIOUSBLOCK) == 0)
         return ROUTE_STICKY;
-    }
+
+    if (strcmp(method, METHOD_VALIDATEADDRESS) == 0)
+        return ROUTE_RACE;
+
+    if (strcmp(method, METHOD_DECODERAWTX) == 0)
+        return ROUTE_RACE;
 
     /* Unknown/other method: fan-out race */
     return ROUTE_RACE;
@@ -104,7 +107,9 @@ is_known_method(const char *method)
     return (strcmp(method, METHOD_GBT) == 0 ||
             strcmp(method, METHOD_SUBMITBLOCK) == 0 ||
             strcmp(method, METHOD_SENDRAWTX) == 0 ||
-            strcmp(method, METHOD_PRECIOUSBLOCK) == 0);
+            strcmp(method, METHOD_PRECIOUSBLOCK) == 0 ||
+            strcmp(method, METHOD_VALIDATEADDRESS) == 0 ||
+            strcmp(method, METHOD_DECODERAWTX) == 0);
 }
 
 /* ---- Random string generators ---- */
@@ -141,11 +146,11 @@ gen_random_special(char *buf, size_t buf_size, size_t max_len)
 }
 
 /* Generate a method name for testing. Distribution:
- * - 20% chance: one of the 4 known methods
- * - 20% chance: a near-miss of a known method (prefix/suffix/case variation)
- * - 20% chance: empty string
- * - 20% chance: random alphanumeric string
- * - 20% chance: random string with special characters or very long string
+ * - ~30% chance: one of the 6 known methods
+ * - ~20% chance: a near-miss of a known method (prefix/suffix/case variation)
+ * - ~10% chance: empty string
+ * - ~20% chance: random alphanumeric string
+ * - ~20% chance: random string with special characters or very long string
  */
 static void
 gen_random_method(char *buf, size_t buf_size)
@@ -162,12 +167,18 @@ gen_random_method(char *buf, size_t buf_size)
         snprintf(buf, buf_size, "%s", METHOD_SUBMITBLOCK);
         break;
     case 2:
-        /* Known: sendrawtransaction */
-        snprintf(buf, buf_size, "%s", METHOD_SENDRAWTX);
+        /* Known: sendrawtransaction or validateaddress (alternate) */
+        if (lrand48() % 2 == 0)
+            snprintf(buf, buf_size, "%s", METHOD_SENDRAWTX);
+        else
+            snprintf(buf, buf_size, "%s", METHOD_VALIDATEADDRESS);
         break;
     case 3:
-        /* Known: preciousblock */
-        snprintf(buf, buf_size, "%s", METHOD_PRECIOUSBLOCK);
+        /* Known: preciousblock or decoderawtransaction (alternate) */
+        if (lrand48() % 2 == 0)
+            snprintf(buf, buf_size, "%s", METHOD_PRECIOUSBLOCK);
+        else
+            snprintf(buf, buf_size, "%s", METHOD_DECODERAWTX);
         break;
     case 4:
         /* Near-miss: case variation of a known method */
@@ -176,9 +187,11 @@ gen_random_method(char *buf, size_t buf_size)
                 "GetBlockTemplate", "GETBLOCKTEMPLATE", "Submitblock",
                 "SUBMITBLOCK", "SendRawTransaction", "SENDRAWTRANSACTION",
                 "PreciousBlock", "PRECIOUSBLOCK", "getBlockTemplate",
-                "submitBlock", "sendRawTransaction", "preciousBlock"
+                "submitBlock", "sendRawTransaction", "preciousBlock",
+                "ValidateAddress", "VALIDATEADDRESS", "DecodeRawTransaction",
+                "DECODERAWTRANSACTION"
             };
-            int idx = (int)(lrand48() % 12);
+            int idx = (int)(lrand48() % 16);
             snprintf(buf, buf_size, "%s", methods[idx]);
         }
         break;
@@ -188,9 +201,11 @@ gen_random_method(char *buf, size_t buf_size)
             const char *variants[] = {
                 "getblock", "getblocktemplates", "submitblocks",
                 "sendrawtransactions", "preciousblocks", "getblocktemplate2",
-                "xgetblocktemplate", "submitblock_", "_preciousblock"
+                "xgetblocktemplate", "submitblock_", "_preciousblock",
+                "validateaddresses", "decoderawtransactions",
+                "xvalidateaddress", "decoderawtransaction_"
             };
-            int idx = (int)(lrand48() % 9);
+            int idx = (int)(lrand48() % 13);
             snprintf(buf, buf_size, "%s", variants[idx]);
         }
         break;
@@ -203,7 +218,7 @@ gen_random_method(char *buf, size_t buf_size)
         gen_random_alnum(buf, buf_size, 20);
         break;
     case 8:
-        /* Random alphanumeric (long: 50-127 chars, near method[] buffer limit) */
+        /* Random alphanumeric (long: 50-120 chars) */
         gen_random_alnum(buf, buf_size, 120);
         break;
     case 9:
@@ -229,20 +244,20 @@ strategy_name(route_strategy_t s)
 }
 
 /*
- * Property 2: RPC Method Routing Classification
+ * Property 10: Method routing classification
  *
- * For any RPC method name string, the routing decision shall be:
+ * For any method string, classify_method() SHALL return the correct
+ * routing strategy per the specification table:
  *   getblocktemplate → race (when notify_pending or no sticky)
  *   getblocktemplate → sticky (when sticky exists and no notify_pending)
  *   submitblock → broadcast
  *   sendrawtransaction → broadcast
  *   preciousblock → sticky-only
+ *   validateaddress → race
+ *   decoderawtransaction → race
  *   all others → fan-out race
  *
- * This test generates random method names and verifies the routing
- * classification matches the specification table under various proxy states.
- *
- * Validates: Requirements 4.1, 4.5, 5.1, 6.1, 7.1, 8.1
+ * Validates: Requirements 12.1
  */
 static void
 test_property_rpc_routing(long seed)
@@ -275,24 +290,23 @@ test_property_rpc_routing(long seed)
         route_strategy_t verified;
 
         if (strcmp(method, METHOD_GBT) == 0) {
-            /* Req 5.1: first GBT after notify → race all nodes */
-            /* Design: race if notify_pending or no sticky, else sticky */
             if (notify_pending || sticky_node_idx == -1) {
                 verified = ROUTE_RACE;
             } else {
                 verified = ROUTE_STICKY;
             }
         } else if (strcmp(method, METHOD_SUBMITBLOCK) == 0) {
-            /* Req 6.1: submitblock → broadcast to all */
             verified = ROUTE_BROADCAST;
         } else if (strcmp(method, METHOD_SENDRAWTX) == 0) {
-            /* Req 7.1: sendrawtransaction → broadcast to all */
             verified = ROUTE_BROADCAST;
         } else if (strcmp(method, METHOD_PRECIOUSBLOCK) == 0) {
-            /* Req 8.1: preciousblock → sticky only */
             verified = ROUTE_STICKY;
+        } else if (strcmp(method, METHOD_VALIDATEADDRESS) == 0) {
+            verified = ROUTE_RACE;
+        } else if (strcmp(method, METHOD_DECODERAWTX) == 0) {
+            verified = ROUTE_RACE;
         } else {
-            /* Req 4.1, 4.5: unknown methods → fan-out race */
+            /* Unknown methods → fan-out race */
             verified = ROUTE_RACE;
         }
 
@@ -322,7 +336,7 @@ test_property_rpc_routing(long seed)
             }
         }
 
-        /* Invariant 2: sendrawtransaction ALWAYS maps to BROADCAST regardless of state */
+        /* Invariant 2: sendrawtransaction ALWAYS maps to BROADCAST */
         if (strcmp(method, METHOD_SENDRAWTX) == 0) {
             if (expected != ROUTE_BROADCAST) {
                 fprintf(stderr, "  FAIL trial %d: sendrawtransaction must always be BROADCAST\n", i);
@@ -333,7 +347,7 @@ test_property_rpc_routing(long seed)
             }
         }
 
-        /* Invariant 3: preciousblock ALWAYS maps to STICKY regardless of state */
+        /* Invariant 3: preciousblock ALWAYS maps to STICKY */
         if (strcmp(method, METHOD_PRECIOUSBLOCK) == 0) {
             if (expected != ROUTE_STICKY) {
                 fprintf(stderr, "  FAIL trial %d: preciousblock must always be STICKY\n", i);
@@ -344,7 +358,29 @@ test_property_rpc_routing(long seed)
             }
         }
 
-        /* Invariant 4: Unknown methods ALWAYS map to RACE regardless of state */
+        /* Invariant 4: validateaddress ALWAYS maps to RACE */
+        if (strcmp(method, METHOD_VALIDATEADDRESS) == 0) {
+            if (expected != ROUTE_RACE) {
+                fprintf(stderr, "  FAIL trial %d: validateaddress must always be RACE\n", i);
+                fprintf(stderr, "  (seed=%ld, trial=%d)\n", seed, i);
+                fprintf(stderr, "  got: %s\n", strategy_name(expected));
+                tests_run++;
+                return;
+            }
+        }
+
+        /* Invariant 5: decoderawtransaction ALWAYS maps to RACE */
+        if (strcmp(method, METHOD_DECODERAWTX) == 0) {
+            if (expected != ROUTE_RACE) {
+                fprintf(stderr, "  FAIL trial %d: decoderawtransaction must always be RACE\n", i);
+                fprintf(stderr, "  (seed=%ld, trial=%d)\n", seed, i);
+                fprintf(stderr, "  got: %s\n", strategy_name(expected));
+                tests_run++;
+                return;
+            }
+        }
+
+        /* Invariant 6: Unknown methods ALWAYS map to RACE */
         if (!is_known_method(method)) {
             if (expected != ROUTE_RACE) {
                 fprintf(stderr, "  FAIL trial %d: unknown method must always be RACE\n", i);
@@ -356,7 +392,7 @@ test_property_rpc_routing(long seed)
             }
         }
 
-        /* Invariant 5: GBT with notify_pending ALWAYS maps to RACE */
+        /* Invariant 7: GBT with notify_pending ALWAYS maps to RACE */
         if (strcmp(method, METHOD_GBT) == 0 && notify_pending) {
             if (expected != ROUTE_RACE) {
                 fprintf(stderr, "  FAIL trial %d: GBT with notify_pending must be RACE\n", i);
@@ -367,7 +403,7 @@ test_property_rpc_routing(long seed)
             }
         }
 
-        /* Invariant 6: GBT with no sticky ALWAYS maps to RACE */
+        /* Invariant 8: GBT with no sticky ALWAYS maps to RACE */
         if (strcmp(method, METHOD_GBT) == 0 && sticky_node_idx == -1) {
             if (expected != ROUTE_RACE) {
                 fprintf(stderr, "  FAIL trial %d: GBT with no sticky must be RACE\n", i);
@@ -378,7 +414,7 @@ test_property_rpc_routing(long seed)
             }
         }
 
-        /* Invariant 7: GBT with sticky and no notify_pending maps to STICKY */
+        /* Invariant 9: GBT with sticky and no notify_pending maps to STICKY */
         if (strcmp(method, METHOD_GBT) == 0 && sticky_node_idx >= 0 && !notify_pending) {
             if (expected != ROUTE_STICKY) {
                 fprintf(stderr, "  FAIL trial %d: GBT with sticky and no notify must be STICKY\n", i);
@@ -389,7 +425,7 @@ test_property_rpc_routing(long seed)
             }
         }
 
-        /* Invariant 8: Method routing is case-sensitive — case variations
+        /* Invariant 10: Method routing is case-sensitive — case variations
          * of known methods are treated as unknown (fan-out race) */
         if (!is_known_method(method) && expected != ROUTE_RACE) {
             fprintf(stderr, "  FAIL trial %d: non-exact-match method must be RACE\n", i);
@@ -494,9 +530,9 @@ test_property_broadcast_state_independent(long seed)
             fprintf(stderr, "  FAIL trial %d: broadcast method not always BROADCAST\n", i);
             fprintf(stderr, "  (seed=%ld, trial=%d)\n", seed, i);
             fprintf(stderr, "  method: '%s'\n", method);
-            fprintf(stderr, "  state1: sticky=%d notify=%d → %s\n",
+            fprintf(stderr, "  state1: sticky=%d notify=%d -> %s\n",
                     sticky1, notify1, strategy_name(result1));
-            fprintf(stderr, "  state2: sticky=%d notify=%d → %s\n",
+            fprintf(stderr, "  state2: sticky=%d notify=%d -> %s\n",
                     sticky2, notify2, strategy_name(result2));
             tests_run++;
             return;
@@ -539,7 +575,7 @@ test_property_preciousblock_always_sticky(long seed)
         if (result != ROUTE_STICKY) {
             fprintf(stderr, "  FAIL trial %d: preciousblock not STICKY\n", i);
             fprintf(stderr, "  (seed=%ld, trial=%d)\n", seed, i);
-            fprintf(stderr, "  sticky=%d, notify=%d → %s\n",
+            fprintf(stderr, "  sticky=%d, notify=%d -> %s\n",
                     sticky_node_idx, notify_pending, strategy_name(result));
             tests_run++;
             return;

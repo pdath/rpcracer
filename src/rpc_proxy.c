@@ -1,6 +1,7 @@
 /* rpc_proxy.c — RPC proxy: client connection, request parsing, race dispatch */
 
 #include "rpc_proxy.h"
+#include "conn_pair.h"
 #include "rpc_conn.h"
 #include "log.h"
 #include "util.h"
@@ -25,8 +26,7 @@
 typedef enum {
     RACE_IDLE,
     RACE_FANOUT,
-    RACE_STICKY,
-    RACE_RETRY_WAIT
+    RACE_STICKY
 } race_state_t;
 
 /* ---- Internal proxy structure ---- */
@@ -69,18 +69,18 @@ struct rpc_proxy {
     /* Parsed request info */
     char method[128];           /* extracted JSON-RPC method name */
 
-    /* Upstream connections */
-    upstream_conn_t upstreams[MAX_NODES];
-    int upstream_count;
+    /* Connection pairs (replaces upstreams[]) */
+    conn_pair_t pairs[MAX_NODES];
+    int pair_count;
+
+    /* Per-node retry tracking: true if this node already got its one retry */
+    bool node_retried[MAX_NODES];
+
+    /* Request length preserved for retry (client_recv_len is reset after dispatch) */
+    size_t request_len;
 
     /* RPC timeout timer (one-shot timerfd, -1 when inactive) */
     int rpc_timeout_timer_fd;
-
-    /* GBT retry state (post-notify all-fail retry loop) */
-    int retry_timer_fd;             /* one-shot 100ms poll timerfd, -1 when inactive */
-    int retry_deadline_timer_fd;    /* one-shot deadline timerfd, -1 when inactive */
-    int retry_attempts;             /* number of re-dispatch attempts made */
-    bool is_post_notify_gbt;        /* true when current race is a post-notify GBT */
 };
 
 /* ---- Method routing strategies ---- */
@@ -99,8 +99,6 @@ static int extract_json_rpc_method(rpc_proxy_t *proxy);
 static route_strategy_t classify_method(rpc_proxy_t *proxy);
 static int dispatch_fanout(rpc_proxy_t *proxy);
 static int dispatch_sticky(rpc_proxy_t *proxy);
-static void send_rpc_error_to_client(rpc_proxy_t *proxy, int code,
-                                     const char *message);
 
 /* Race response handling callbacks */
 static void on_upstream_response(upstream_conn_t *conn, void *data);
@@ -116,13 +114,6 @@ static void rpc_timeout_cb(event_loop_t *loop, int fd, uint32_t events,
                            void *data);
 static void start_rpc_timeout(rpc_proxy_t *proxy);
 static void cancel_rpc_timeout(rpc_proxy_t *proxy);
-
-/* GBT retry helpers (implemented in tasks 3.4, 3.5, 3.6) */
-static void retry_poll_cb(event_loop_t *loop, int fd, uint32_t events,
-                          void *data);
-static void retry_deadline_cb(event_loop_t *loop, int fd, uint32_t events,
-                              void *data);
-static bool enter_retry_wait(rpc_proxy_t *proxy);
 
 /* ---- Method name constants ---- */
 static const char METHOD_GBT[] = "getblocktemplate";
@@ -213,7 +204,7 @@ listener_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
     char peer_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &peer_addr.sin_addr, peer_ip, sizeof(peer_ip));
 
-    /* Req 13.1: If a client is already connected, drop it and accept the new one */
+    /* If a client is already connected, drop it and accept the new one */
     if (proxy->client_connected) {
         log_msg(LOG_INFO, "[rpc_proxy] New client from %s:%u — dropping existing client",
                 peer_ip, ntohs(peer_addr.sin_port));
@@ -268,8 +259,6 @@ client_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
     rpc_proxy_t *proxy = (rpc_proxy_t *)data;
 
     if (events & (EPOLLERR | EPOLLHUP)) {
-        /* Req 13.2: Client disconnect mid-race — let upstream complete,
-         * discard responses. We just mark client as gone. */
         log_msg(LOG_INFO, "[rpc_proxy] Client connection error/hangup");
         close_client(proxy);
         return;
@@ -301,8 +290,6 @@ client_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
     }
 
     if (n == 0) {
-        /* Client closed connection gracefully */
-        /* Req 13.2: let upstream requests complete, discard responses */
         log_msg(LOG_INFO, "[rpc_proxy] Client disconnected (EOF)");
         close_client(proxy);
         return;
@@ -312,12 +299,10 @@ client_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
 
     /* Try to parse a complete HTTP request */
     if (parse_http_request(proxy)) {
-        /* Single request in-flight enforcement:
-         * If a race or sticky request is already active, drop this request */
+        /* Single request in-flight enforcement */
         if (proxy->state != RACE_IDLE) {
             log_msg(LOG_WARN, "[rpc_proxy] Request received while race/sticky "
                     "active (state=%d) — dropping request", proxy->state);
-            /* Reset recv buffer for next request (discard this one) */
             proxy->client_recv_len = 0;
             return;
         }
@@ -330,7 +315,6 @@ client_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
             return;
         }
 
-        /* Req 9.7: Log RPC method name for every request */
         log_msg(LOG_INFO, "[rpc_proxy] RPC request: method=%s", proxy->method);
 
         /* Record request in stats */
@@ -350,20 +334,9 @@ client_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
             proxy->best_gbt_node_idx = -1;
             proxy->gbt_height_matched = false;
             if (dispatch_fanout(proxy) <= 0) {
-                /* Post-notify GBT all-fail: enter retry wait instead of
-                 * immediate error (Req 2.3, 3.1, 3.4) */
-                if (proxy->is_post_notify_gbt &&
-                    strcmp(proxy->method, METHOD_GBT) == 0 &&
-                    enter_retry_wait(proxy)) {
-                    /* Retry wait entered successfully */
-                    break;
-                }
-                /* Non-GBT, non-post-notify, or retry disabled:
-                 * No nodes available — return error immediately (Req 13.3) */
                 log_msg(LOG_CRIT, "[rpc_proxy] All nodes unreachable for "
-                        "method=%s", proxy->method);
-                send_rpc_error_to_client(proxy, -1,
-                    "All upstream nodes unreachable");
+                        "method=%s — closing client", proxy->method);
+                close_client(proxy);
                 proxy->state = RACE_IDLE;
             } else {
                 start_rpc_timeout(proxy);
@@ -380,9 +353,8 @@ client_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
             proxy->gbt_height_matched = false;
             if (dispatch_fanout(proxy) <= 0) {
                 log_msg(LOG_CRIT, "[rpc_proxy] All nodes unreachable for "
-                        "method=%s", proxy->method);
-                send_rpc_error_to_client(proxy, -1,
-                    "All upstream nodes unreachable");
+                        "method=%s — closing client", proxy->method);
+                close_client(proxy);
                 proxy->state = RACE_IDLE;
             } else {
                 start_rpc_timeout(proxy);
@@ -398,7 +370,6 @@ client_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
             proxy->best_gbt_node_idx = -1;
             proxy->gbt_height_matched = false;
             if (dispatch_sticky(proxy) < 0) {
-                /* dispatch_sticky handles error responses internally */
                 proxy->state = RACE_IDLE;
             } else {
                 start_rpc_timeout(proxy);
@@ -522,56 +493,35 @@ extract_json_rpc_method(rpc_proxy_t *proxy)
 
 /* ---- Method routing classification ---- */
 
-/* Classify the current method into a routing strategy.
- * Also logs unexpected methods at LOG_WARN (Req 4.5). */
 static route_strategy_t
 classify_method(rpc_proxy_t *proxy)
 {
     const char *method = proxy->method;
 
-    /* Default: not a post-notify GBT race. Only the post-notify GBT path
-     * below will override this to true. */
-    proxy->is_post_notify_gbt = false;
-
     if (strcmp(method, METHOD_GBT) == 0) {
-        /* getblocktemplate: race if notify_pending or no sticky, else sticky */
         if (proxy->notify_pending || proxy->sticky_node_idx == -1) {
-            /* First GBT after notify (or startup with no sticky) → race */
-            proxy->is_post_notify_gbt = proxy->notify_pending;
             proxy->notify_pending = false;
             return ROUTE_RACE;
         }
-        /* Subsequent GBT → sticky (Req 5.4) */
-        proxy->is_post_notify_gbt = false;
         return ROUTE_STICKY;
     }
 
-    if (strcmp(method, METHOD_SUBMITBLOCK) == 0) {
-        /* submitblock: broadcast to all, all must complete (Req 6.1) */
+    if (strcmp(method, METHOD_SUBMITBLOCK) == 0)
         return ROUTE_BROADCAST;
-    }
 
-    if (strcmp(method, METHOD_SENDRAWTX) == 0) {
-        /* sendrawtransaction: broadcast to all, all must complete (Req 7.1) */
+    if (strcmp(method, METHOD_SENDRAWTX) == 0)
         return ROUTE_BROADCAST;
-    }
 
-    if (strcmp(method, METHOD_PRECIOUSBLOCK) == 0) {
-        /* preciousblock: sticky only (Req 8.1) */
+    if (strcmp(method, METHOD_PRECIOUSBLOCK) == 0)
         return ROUTE_STICKY;
-    }
 
-    if (strcmp(method, METHOD_VALIDATEADDRESS) == 0) {
-        /* validateaddress: known method, fan-out race (Req 4.1) */
+    if (strcmp(method, METHOD_VALIDATEADDRESS) == 0)
         return ROUTE_RACE;
-    }
 
-    if (strcmp(method, METHOD_DECODERAWTX) == 0) {
-        /* decoderawtransaction: known method, fan-out race (Req 4.1) */
+    if (strcmp(method, METHOD_DECODERAWTX) == 0)
         return ROUTE_RACE;
-    }
 
-    /* Unknown/other method: log warning, use fan-out race (Req 4.5) */
+    /* Unknown method: fan-out race */
     log_msg(LOG_WARN, "[rpc_proxy] Unexpected RPC method: %s — "
             "processing via fan-out race", method);
     return ROUTE_RACE;
@@ -579,31 +529,36 @@ classify_method(rpc_proxy_t *proxy)
 
 /* ---- Fan-out dispatch ---- */
 
-/* Send the client request to all connected upstream nodes.
+/* Send the client request to all available upstream nodes (via conn_pair).
  * Returns the number of nodes dispatched to (0 if none available). */
 static int
 dispatch_fanout(rpc_proxy_t *proxy)
 {
     int sent = 0;
 
-    for (int i = 0; i < proxy->upstream_count; i++) {
-        upstream_conn_t *conn = &proxy->upstreams[i];
+    /* Reset per-node retry tracking for new dispatch */
+    memset(proxy->node_retried, 0, sizeof(proxy->node_retried));
 
-        if (conn->state != CONN_CONNECTED) {
-            log_msg(LOG_DEBUG, "[rpc_proxy] Upstream[%d] (%s) not connected "
-                    "(state=%d), skipping",
-                    i, conn->config->label, conn->state);
+    /* Preserve request length for potential retry (client_recv_len resets after dispatch) */
+    proxy->request_len = proxy->client_recv_len;
+
+    for (int i = 0; i < proxy->pair_count; i++) {
+        if (!conn_pair_is_available(&proxy->pairs[i])) {
+            log_msg(LOG_DEBUG, "[rpc_proxy] Pair[%d] (%s) not available, skipping",
+                    i, conn_pair_get_label(&proxy->pairs[i]));
             continue;
         }
+
+        upstream_conn_t *conn = conn_pair_get_active(&proxy->pairs[i]);
 
         if (rpc_conn_send(conn, proxy->client_recv_buf,
                           proxy->client_recv_len) == 0) {
             sent++;
-            log_msg(LOG_DEBUG, "[rpc_proxy] Dispatched to upstream[%d] (%s)",
+            log_msg(LOG_DEBUG, "[rpc_proxy] Dispatched to pair[%d] (%s)",
                     i, conn->config->label);
         } else {
             log_msg(LOG_WARN, "[rpc_proxy] rpc_conn_send failed for "
-                    "upstream[%d] (%s)", i, conn->config->label);
+                    "pair[%d] (%s)", i, conn->config->label);
         }
     }
 
@@ -611,7 +566,7 @@ dispatch_fanout(rpc_proxy_t *proxy)
 
     log_msg(LOG_DEBUG, "[rpc_proxy] Fan-out dispatched to %d/%d nodes "
             "(method=%s, all_must_complete=%d)",
-            sent, proxy->upstream_count, proxy->method,
+            sent, proxy->pair_count, proxy->method,
             proxy->all_must_complete);
 
     return sent;
@@ -620,25 +575,27 @@ dispatch_fanout(rpc_proxy_t *proxy)
 /* ---- Sticky dispatch ---- */
 
 /* Send the client request to the sticky node only.
- * For preciousblock with no sticky: returns RPC error (Req 8.2).
- * For GBT with sticky unreachable: falls back to fan-out race.
- * Returns 0 on success, -1 on failure (error already sent to client). */
+ * Returns 0 on success, -1 on failure (client closed). */
 static int
 dispatch_sticky(rpc_proxy_t *proxy)
 {
     const char *method = proxy->method;
     bool is_preciousblock = (strcmp(method, METHOD_PRECIOUSBLOCK) == 0);
 
-    /* Req 8.2: preciousblock with no sticky → error */
+    /* Reset per-node retry tracking for new dispatch */
+    memset(proxy->node_retried, 0, sizeof(proxy->node_retried));
+
+    /* Preserve request length for potential retry */
+    proxy->request_len = proxy->client_recv_len;
+
     if (proxy->sticky_node_idx == -1) {
         if (is_preciousblock) {
             log_msg(LOG_WARN, "[rpc_proxy] preciousblock with no sticky node "
-                    "— returning error");
-            send_rpc_error_to_client(proxy, -32000,
-                "No sticky node designated — cannot route preciousblock");
+                    "— closing client");
+            close_client(proxy);
             return -1;
         }
-        /* GBT with no sticky (shouldn't happen via classify, but handle) */
+        /* GBT with no sticky — fall back to fan-out */
         log_msg(LOG_INFO, "[rpc_proxy] No sticky node for method=%s, "
                 "falling back to fan-out race", method);
         proxy->state = RACE_FANOUT;
@@ -649,32 +606,29 @@ dispatch_sticky(rpc_proxy_t *proxy)
         int sent = dispatch_fanout(proxy);
         if (sent <= 0) {
             log_msg(LOG_CRIT, "[rpc_proxy] All nodes unreachable for "
-                    "method=%s", method);
-            send_rpc_error_to_client(proxy, -1,
-                "All upstream nodes unreachable");
+                    "method=%s — closing client", method);
+            close_client(proxy);
             return -1;
         }
         return 0;
     }
 
-    /* Check if sticky node is reachable */
-    upstream_conn_t *sticky = &proxy->upstreams[proxy->sticky_node_idx];
-
-    if (sticky->state != CONN_CONNECTED) {
-        /* Req 8.3: preciousblock with sticky unreachable → error */
+    /* Check if sticky node is reachable via conn_pair */
+    if (!conn_pair_is_available(&proxy->pairs[proxy->sticky_node_idx])) {
         if (is_preciousblock) {
             log_msg(LOG_WARN, "[rpc_proxy] Sticky node[%d] (%s) unreachable "
-                    "for preciousblock — returning error",
-                    proxy->sticky_node_idx, sticky->config->label);
-            send_rpc_error_to_client(proxy, -32001,
-                "Sticky node unreachable — cannot route preciousblock");
+                    "for preciousblock — closing client",
+                    proxy->sticky_node_idx,
+                    proxy->pairs[proxy->sticky_node_idx].config->label);
+            close_client(proxy);
             return -1;
         }
 
         /* GBT with sticky unreachable → fall back to fan-out race */
         log_msg(LOG_INFO, "[rpc_proxy] Sticky node[%d] (%s) unreachable for "
                 "method=%s — falling back to fan-out race",
-                proxy->sticky_node_idx, sticky->config->label, method);
+                proxy->sticky_node_idx,
+                proxy->pairs[proxy->sticky_node_idx].config->label, method);
         proxy->state = RACE_FANOUT;
         proxy->all_must_complete = false;
         proxy->best_gbt_height = -1;
@@ -683,15 +637,15 @@ dispatch_sticky(rpc_proxy_t *proxy)
         int sent = dispatch_fanout(proxy);
         if (sent <= 0) {
             log_msg(LOG_CRIT, "[rpc_proxy] All nodes unreachable for "
-                    "method=%s", method);
-            send_rpc_error_to_client(proxy, -1,
-                "All upstream nodes unreachable");
+                    "method=%s — closing client", method);
+            close_client(proxy);
             return -1;
         }
         return 0;
     }
 
     /* Send to sticky node */
+    upstream_conn_t *sticky = conn_pair_get_active(&proxy->pairs[proxy->sticky_node_idx]);
     if (rpc_conn_send(sticky, proxy->client_recv_buf,
                       proxy->client_recv_len) < 0) {
         log_msg(LOG_WARN, "[rpc_proxy] rpc_conn_send failed for sticky "
@@ -699,8 +653,9 @@ dispatch_sticky(rpc_proxy_t *proxy)
                 sticky->config->label);
 
         if (is_preciousblock) {
-            send_rpc_error_to_client(proxy, -32001,
-                "Sticky node send failed — cannot route preciousblock");
+            log_msg(LOG_WARN, "[rpc_proxy] Sticky node send failed for "
+                    "preciousblock — closing client");
+            close_client(proxy);
             return -1;
         }
 
@@ -712,8 +667,9 @@ dispatch_sticky(rpc_proxy_t *proxy)
         proxy->gbt_height_matched = false;
         int sent = dispatch_fanout(proxy);
         if (sent <= 0) {
-            send_rpc_error_to_client(proxy, -1,
-                "All upstream nodes unreachable");
+            log_msg(LOG_CRIT, "[rpc_proxy] All nodes unreachable — "
+                    "closing client");
+            close_client(proxy);
             return -1;
         }
         return 0;
@@ -727,48 +683,23 @@ dispatch_sticky(rpc_proxy_t *proxy)
     return 0;
 }
 
-/* ---- RPC error response to client ---- */
-
-/* Send an HTTP response with a JSON-RPC error body to the client.
- * Used for preciousblock with no sticky, all-nodes-unreachable, etc. */
-static void
-send_rpc_error_to_client(rpc_proxy_t *proxy, int code, const char *message)
-{
-    if (!proxy->client_connected)
-        return;
-
-    /* Build JSON-RPC error response */
-    char body[512];
-    int body_len = snprintf(body, sizeof(body),
-        "{\"result\":null,\"error\":{\"code\":%d,\"message\":\"%s\"},\"id\":null}",
-        code, message);
-
-    if (body_len < 0 || (size_t)body_len >= sizeof(body))
-        body_len = (int)strlen(body);
-
-    /* Build HTTP response */
-    char response[768];
-    int resp_len = snprintf(response, sizeof(response),
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: application/json\r\n"
-        "Content-Length: %d\r\n"
-        "Connection: keep-alive\r\n"
-        "\r\n"
-        "%s",
-        body_len, body);
-
-    if (resp_len < 0 || (size_t)resp_len >= sizeof(response))
-        return;
-
-    /* Best-effort send to client (non-blocking) */
-    ssize_t n = send(proxy->client_fd, response, (size_t)resp_len, MSG_NOSIGNAL);
-    if (n < 0) {
-        log_msg(LOG_WARN, "[rpc_proxy] Failed to send error response to "
-                "client: %s", strerror(errno));
-    }
-}
-
 /* ---- Race response handling ---- */
+
+/* Parse the HTTP status code from an upstream response.
+ * Returns the status code (e.g. 200, 401, 500), or 0 if unparseable. */
+static int
+parse_http_status(const upstream_conn_t *conn)
+{
+    if (!conn->headers_complete || conn->recv_len < 12)
+        return 0;
+
+    const char *buf = (const char *)conn->recv_buf;
+    if (strncmp(buf, "HTTP/", 5) != 0)
+        return 0;
+
+    const char *sp = memchr(buf, ' ', conn->recv_len < 16 ? conn->recv_len : 16);
+    return sp ? atoi(sp + 1) : 0;
+}
 
 /* Check if an upstream response indicates an error.
  * An error is: HTTP status != 200, or JSON body has non-null "error" field.
@@ -784,7 +715,6 @@ response_is_error(const upstream_conn_t *conn)
     int http_status = 0;
 
     if (conn->recv_len >= 12 && strncmp(buf, "HTTP/", 5) == 0) {
-        /* Find the space after version, then parse status code */
         const char *sp = memchr(buf, ' ', conn->recv_len < 16 ? conn->recv_len : 16);
         if (sp)
             http_status = atoi(sp + 1);
@@ -798,14 +728,14 @@ response_is_error(const upstream_conn_t *conn)
     size_t body_len = 0;
 
     if (rpc_conn_get_response(conn, &body, &body_len) < 0)
-        return 1;  /* Can't get body — treat as error */
+        return 1;
 
     if (body_len == 0)
-        return 1;  /* Empty body — treat as error */
+        return 1;
 
     yyjson_doc *doc = yyjson_read((const char *)body, body_len, 0);
     if (!doc)
-        return 1;  /* Can't parse JSON — treat as error */
+        return 1;
 
     yyjson_val *root = yyjson_doc_get_root(doc);
     if (!root || !yyjson_is_obj(root)) {
@@ -859,8 +789,7 @@ parse_rpc_error_code(const upstream_conn_t *conn)
 }
 
 /* Parse the "height" field from a GBT response body.
- * The height is inside the "result" object: {"result": {"height": N, ...}, ...}
- * Returns the height value on success, -1 on failure (parse error, missing field). */
+ * Returns the height value on success, -1 on failure. */
 static int64_t
 parse_gbt_height(const upstream_conn_t *conn)
 {
@@ -900,9 +829,7 @@ parse_gbt_height(const upstream_conn_t *conn)
     return height;
 }
 
-/* Parse the transaction count from a GBT response body.
- * The transactions array is inside "result": {"result": {"transactions": [...], ...}, ...}
- * Returns the array size on success, 0 on failure (parse error, missing field). */
+/* Parse the transaction count from a GBT response body. */
 static uint32_t
 parse_gbt_tx_count(const upstream_conn_t *conn)
 {
@@ -942,15 +869,13 @@ parse_gbt_tx_count(const upstream_conn_t *conn)
     return count;
 }
 
-/* Send the full HTTP response from an upstream connection to the client.
- * Writes the entire recv_buf content (headers + body) to the client fd. */
+/* Send the full HTTP response from an upstream connection to the client. */
 static void
 send_upstream_response_to_client(rpc_proxy_t *proxy, upstream_conn_t *conn)
 {
     if (!proxy->client_connected)
         return;
 
-    /* The recv_buf contains the full HTTP response (headers + body) */
     size_t total = conn->header_len + conn->content_length;
     if (total == 0 || total > conn->recv_len)
         return;
@@ -962,7 +887,7 @@ send_upstream_response_to_client(rpc_proxy_t *proxy, upstream_conn_t *conn)
                          total - sent, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
-                break;  /* Can't send more right now — partial send */
+                break;
             log_msg(LOG_WARN, "[rpc_proxy] Failed to send response to "
                     "client: %s", strerror(errno));
             break;
@@ -991,7 +916,6 @@ start_rpc_timeout(rpc_proxy_t *proxy)
     uint32_t ms = proxy->cfg->rpc_timeout_ms;
     its.it_value.tv_sec = (time_t)(ms / 1000);
     its.it_value.tv_nsec = (long)((ms % 1000) * 1000000);
-    /* it_interval left at zero → one-shot */
 
     if (timerfd_settime(tfd, 0, &its, NULL) < 0) {
         log_msg(LOG_WARN, "[rpc_proxy] timerfd_settime for rpc timeout failed: %s",
@@ -1021,278 +945,6 @@ cancel_rpc_timeout(rpc_proxy_t *proxy)
     proxy->rpc_timeout_timer_fd = -1;
 }
 
-/* ---- GBT retry wait helpers ---- */
-
-/* Enter the retry wait state for a post-notify GBT all-fail scenario.
- * Returns true if retry was entered, false if retry is disabled
- * (gbt_retry_timeout_ms == 0) and caller should fall through to
- * original error behavior. */
-static bool
-enter_retry_wait(rpc_proxy_t *proxy)
-{
-    /* If retry is disabled, fall through to original error behavior */
-    if (proxy->cfg->gbt_retry_timeout_ms == 0)
-        return false;
-
-    /* Transition state to RACE_RETRY_WAIT */
-    proxy->state = RACE_RETRY_WAIT;
-
-    /* Reset all upstream connections */
-    for (int i = 0; i < proxy->upstream_count; i++) {
-        upstream_conn_t *conn = &proxy->upstreams[i];
-        if (conn->send_buf != NULL || conn->state == CONN_RECEIVING ||
-            conn->state == CONN_SENDING) {
-            rpc_conn_reset(conn);
-        }
-    }
-
-    /* Cancel existing RPC timeout timer */
-    cancel_rpc_timeout(proxy);
-
-    /* Create one-shot 100ms timerfd for retry polling */
-    int poll_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-    if (poll_fd < 0) {
-        log_msg(LOG_WARN, "[rpc_proxy] timerfd_create for retry poll failed: %s",
-                strerror(errno));
-        /* Fall back to immediate error */
-        proxy->state = RACE_IDLE;
-        return false;
-    }
-
-    struct itimerspec poll_its = {0};
-    poll_its.it_value.tv_nsec = 100000000L;  /* 100ms */
-    /* it_interval left at zero → one-shot */
-
-    if (timerfd_settime(poll_fd, 0, &poll_its, NULL) < 0) {
-        log_msg(LOG_WARN, "[rpc_proxy] timerfd_settime for retry poll failed: %s",
-                strerror(errno));
-        close(poll_fd);
-        proxy->state = RACE_IDLE;
-        return false;
-    }
-
-    if (event_loop_add_fd(proxy->loop, poll_fd, EPOLLIN,
-                          retry_poll_cb, proxy) < 0) {
-        log_msg(LOG_WARN, "[rpc_proxy] event_loop_add_fd for retry poll failed");
-        close(poll_fd);
-        proxy->state = RACE_IDLE;
-        return false;
-    }
-
-    proxy->retry_timer_fd = poll_fd;
-
-    /* Create one-shot deadline timerfd for gbt_retry_timeout_ms */
-    int deadline_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-    if (deadline_fd < 0) {
-        log_msg(LOG_WARN, "[rpc_proxy] timerfd_create for retry deadline failed: %s",
-                strerror(errno));
-        /* Clean up poll timer and fall back */
-        event_loop_del_fd(proxy->loop, proxy->retry_timer_fd);
-        close(proxy->retry_timer_fd);
-        proxy->retry_timer_fd = -1;
-        proxy->state = RACE_IDLE;
-        return false;
-    }
-
-    uint32_t deadline_ms = proxy->cfg->gbt_retry_timeout_ms;
-    struct itimerspec deadline_its = {0};
-    deadline_its.it_value.tv_sec = (time_t)(deadline_ms / 1000);
-    deadline_its.it_value.tv_nsec = (long)((deadline_ms % 1000) * 1000000);
-    /* it_interval left at zero → one-shot */
-
-    if (timerfd_settime(deadline_fd, 0, &deadline_its, NULL) < 0) {
-        log_msg(LOG_WARN, "[rpc_proxy] timerfd_settime for retry deadline failed: %s",
-                strerror(errno));
-        close(deadline_fd);
-        event_loop_del_fd(proxy->loop, proxy->retry_timer_fd);
-        close(proxy->retry_timer_fd);
-        proxy->retry_timer_fd = -1;
-        proxy->state = RACE_IDLE;
-        return false;
-    }
-
-    if (event_loop_add_fd(proxy->loop, deadline_fd, EPOLLIN,
-                          retry_deadline_cb, proxy) < 0) {
-        log_msg(LOG_WARN, "[rpc_proxy] event_loop_add_fd for retry deadline failed");
-        close(deadline_fd);
-        event_loop_del_fd(proxy->loop, proxy->retry_timer_fd);
-        close(proxy->retry_timer_fd);
-        proxy->retry_timer_fd = -1;
-        proxy->state = RACE_IDLE;
-        return false;
-    }
-
-    proxy->retry_deadline_timer_fd = deadline_fd;
-
-    log_msg(LOG_INFO, "[rpc_proxy] Entering retry wait for post-notify GBT "
-            "(timeout=%u ms)", deadline_ms);
-
-    return true;
-}
-
-/* Retry poll callback: fired every 100ms to check for reconnected nodes.
- * Scans upstreams for CONN_CONNECTED, re-dispatches GBT if found. */
-static void
-retry_poll_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
-{
-    (void)loop;
-    (void)events;
-
-    rpc_proxy_t *proxy = (rpc_proxy_t *)data;
-
-    /* Acknowledge the timerfd expiration (mandatory for timerfd) */
-    uint64_t expirations = 0;
-    ssize_t r = read(fd, &expirations, sizeof(expirations));
-    (void)r;
-
-    /* Guard: only activate when in RACE_RETRY_WAIT state */
-    if (proxy->state != RACE_RETRY_WAIT) {
-        return;
-    }
-
-    /* Scan upstreams for any node in CONN_CONNECTED state */
-    bool found_connected = false;
-    for (int i = 0; i < proxy->upstream_count; i++) {
-        if (proxy->upstreams[i].state == CONN_CONNECTED) {
-            found_connected = true;
-            break;
-        }
-    }
-
-    if (found_connected) {
-        /* Cancel both retry timers */
-        if (proxy->retry_timer_fd >= 0) {
-            event_loop_del_fd(proxy->loop, proxy->retry_timer_fd);
-            close(proxy->retry_timer_fd);
-            proxy->retry_timer_fd = -1;
-        }
-        if (proxy->retry_deadline_timer_fd >= 0) {
-            event_loop_del_fd(proxy->loop, proxy->retry_deadline_timer_fd);
-            close(proxy->retry_deadline_timer_fd);
-            proxy->retry_deadline_timer_fd = -1;
-        }
-
-        /* Re-dispatch the GBT request to all connected nodes */
-        int sent = dispatch_fanout(proxy);
-
-        if (sent > 0) {
-            /* Success: transition to RACE_FANOUT, arm RPC timeout */
-            proxy->state = RACE_FANOUT;
-            start_rpc_timeout(proxy);
-            proxy->retry_attempts++;
-
-            log_msg(LOG_INFO, "[rpc_proxy] Retry poll: re-dispatched GBT to "
-                    "%d node(s) (attempt=%d)", sent, proxy->retry_attempts);
-        } else {
-            /* Node disconnected between check and send — re-arm retry timer,
-             * remain in RACE_RETRY_WAIT. Re-arm both timers since they were
-             * cancelled above. */
-            log_msg(LOG_DEBUG, "[rpc_proxy] Retry poll: node disconnected "
-                    "between check and dispatch, re-arming timers");
-
-            /* Re-arm the 100ms poll timer */
-            int poll_fd = timerfd_create(CLOCK_MONOTONIC,
-                                         TFD_NONBLOCK | TFD_CLOEXEC);
-            if (poll_fd < 0) {
-                log_msg(LOG_WARN, "[rpc_proxy] timerfd_create for retry "
-                        "re-arm failed: %s — sending error", strerror(errno));
-                send_rpc_error_to_client(proxy, -1,
-                    "All upstream nodes unreachable");
-                race_complete(proxy);
-                return;
-            }
-
-            struct itimerspec its = {0};
-            its.it_value.tv_nsec = 100000000L;  /* 100ms */
-
-            if (timerfd_settime(poll_fd, 0, &its, NULL) < 0 ||
-                event_loop_add_fd(proxy->loop, poll_fd, EPOLLIN,
-                                  retry_poll_cb, proxy) < 0) {
-                log_msg(LOG_WARN, "[rpc_proxy] retry poll re-arm failed — "
-                        "sending error");
-                close(poll_fd);
-                send_rpc_error_to_client(proxy, -1,
-                    "All upstream nodes unreachable");
-                race_complete(proxy);
-                return;
-            }
-            proxy->retry_timer_fd = poll_fd;
-
-            /* Re-arm the deadline timer with full timeout (conservative:
-             * avoids needing to track remaining time) */
-            int deadline_fd = timerfd_create(CLOCK_MONOTONIC,
-                                             TFD_NONBLOCK | TFD_CLOEXEC);
-            if (deadline_fd < 0) {
-                log_msg(LOG_WARN, "[rpc_proxy] timerfd_create for deadline "
-                        "re-arm failed: %s", strerror(errno));
-                /* Continue with just the poll timer; eventual reconnect or
-                 * external timeout will clean up */
-                return;
-            }
-
-            uint32_t deadline_ms = proxy->cfg->gbt_retry_timeout_ms;
-            struct itimerspec dits = {0};
-            dits.it_value.tv_sec = (time_t)(deadline_ms / 1000);
-            dits.it_value.tv_nsec = (long)((deadline_ms % 1000) * 1000000);
-
-            if (timerfd_settime(deadline_fd, 0, &dits, NULL) < 0 ||
-                event_loop_add_fd(proxy->loop, deadline_fd, EPOLLIN,
-                                  retry_deadline_cb, proxy) < 0) {
-                log_msg(LOG_WARN, "[rpc_proxy] deadline re-arm failed");
-                close(deadline_fd);
-                return;
-            }
-            proxy->retry_deadline_timer_fd = deadline_fd;
-
-            /* Remain in RACE_RETRY_WAIT */
-        }
-    } else {
-        /* No node connected yet — re-arm the 100ms poll timer */
-        struct itimerspec its = {0};
-        its.it_value.tv_nsec = 100000000L;  /* 100ms */
-        timerfd_settime(proxy->retry_timer_fd, 0, &its, NULL);
-    }
-}
-
-/* Retry deadline callback: fired when gbt_retry_timeout_ms expires.
- * Cancels the retry poll timer, sends an error to the client, and
- * transitions to RACE_IDLE via race_complete. */
-static void
-retry_deadline_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
-{
-    (void)loop;
-    (void)events;
-
-    rpc_proxy_t *proxy = (rpc_proxy_t *)data;
-
-    /* Acknowledge the timerfd expiration */
-    uint64_t expirations = 0;
-    ssize_t r = read(fd, &expirations, sizeof(expirations));
-    (void)r;
-
-    /* Cancel the retry poll timer */
-    if (proxy->retry_timer_fd >= 0) {
-        event_loop_del_fd(proxy->loop, proxy->retry_timer_fd);
-        close(proxy->retry_timer_fd);
-        proxy->retry_timer_fd = -1;
-    }
-
-    /* Clean up the deadline timer itself */
-    if (proxy->retry_deadline_timer_fd >= 0) {
-        event_loop_del_fd(proxy->loop, proxy->retry_deadline_timer_fd);
-        close(proxy->retry_deadline_timer_fd);
-        proxy->retry_deadline_timer_fd = -1;
-    }
-
-    log_msg(LOG_CRIT,
-            "[rpc_proxy] GBT retry timeout expired after %u ms, %d attempts",
-            proxy->cfg->gbt_retry_timeout_ms, proxy->retry_attempts);
-
-    send_rpc_error_to_client(proxy, -1,
-        "All upstream nodes unreachable after retry timeout");
-    race_complete(proxy);
-}
-
 /* Timeout callback: fires when the race exceeds rpc_timeout_ms. */
 static void
 rpc_timeout_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
@@ -1311,9 +963,9 @@ rpc_timeout_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
      * connections still stuck in CONN_RECEIVING from a previous race. */
     if (proxy->state == RACE_IDLE) {
         int drained = 0;
-        for (int i = 0; i < proxy->upstream_count; i++) {
-            upstream_conn_t *conn = &proxy->upstreams[i];
-            if (conn->state == CONN_RECEIVING || conn->state == CONN_SENDING) {
+        for (int i = 0; i < proxy->pair_count; i++) {
+            upstream_conn_t *conn = conn_pair_get_active(&proxy->pairs[i]);
+            if (conn && (conn->state == CONN_RECEIVING || conn->state == CONN_SENDING)) {
                 log_msg(LOG_WARN, "[%s] Drain timeout: resetting stuck "
                         "connection (state=%s, method=%s)",
                         conn->config->label,
@@ -1338,10 +990,39 @@ rpc_timeout_cb(event_loop_t *loop, int fd, uint32_t events, void *data)
     /* Treat all pending nodes as errors */
     proxy->responses_pending = 0;
 
-    /* If no winner was found, send error to client */
+    /* If no winner was found, try GBT height fallback before giving up */
     if (proxy->winner_idx == -1) {
-        send_rpc_error_to_client(proxy, -32000,
-            "RPC timeout: upstream nodes did not respond in time");
+        bool is_gbt_race = (strcmp(proxy->method, "getblocktemplate") == 0 &&
+                            proxy->state == RACE_FANOUT);
+
+        if (is_gbt_race && proxy->best_gbt_node_idx >= 0) {
+            /* Use best height as fallback winner */
+            int best_idx = proxy->best_gbt_node_idx;
+            upstream_conn_t *best_conn = &proxy->pairs[best_idx].slots[proxy->pairs[best_idx].active_idx];
+
+            if (best_conn->state == CONN_CONNECTED ||
+                best_conn->state == CONN_RECEIVING) {
+                /* Response was already received — send it to client */
+                proxy->winner_idx = best_idx;
+                proxy->sticky_node_idx = best_idx;
+
+                if (proxy->best_gbt_height > proxy->last_block_height)
+                    proxy->last_block_height = proxy->best_gbt_height;
+
+                log_msg(LOG_INFO, "[%s] GBT race winner (height fallback on timeout): "
+                        "height=%lld",
+                        best_conn->config->label,
+                        (long long)proxy->best_gbt_height);
+
+                send_upstream_response_to_client(proxy, best_conn);
+            }
+        }
+
+        if (proxy->winner_idx == -1) {
+            log_msg(LOG_CRIT, "[rpc_proxy] RPC timeout with no winner — "
+                    "closing client");
+            close_client(proxy);
+        }
     }
 
     race_complete(proxy);
@@ -1355,9 +1036,8 @@ race_complete(rpc_proxy_t *proxy)
     cancel_rpc_timeout(proxy);
 
     /* Reset all upstream connections that participated */
-    for (int i = 0; i < proxy->upstream_count; i++) {
-        upstream_conn_t *conn = &proxy->upstreams[i];
-        /* Only reset connections that have a send_buf set (participated in race) */
+    for (int i = 0; i < proxy->pair_count; i++) {
+        upstream_conn_t *conn = conn_pair_get_active(&proxy->pairs[i]);
         if (conn->send_buf != NULL || conn->state == CONN_RECEIVING ||
             conn->state == CONN_SENDING) {
             rpc_conn_reset(conn);
@@ -1372,6 +1052,10 @@ race_complete(rpc_proxy_t *proxy)
     proxy->best_gbt_node_idx = -1;
     proxy->gbt_height_matched = false;
 
+    /* Check if any pairs have a pending rotation now that active is idle */
+    for (int i = 0; i < proxy->pair_count; i++)
+        conn_pair_tick(&proxy->pairs[i]);
+
     log_msg(LOG_DEBUG, "[rpc_proxy] Race complete, state → IDLE");
 }
 
@@ -1379,7 +1063,8 @@ race_complete(rpc_proxy_t *proxy)
 static void
 on_upstream_response(upstream_conn_t *conn, void *data)
 {
-    rpc_proxy_t *proxy = (rpc_proxy_t *)data;
+    conn_pair_t *pair = (conn_pair_t *)data;
+    rpc_proxy_t *proxy = (rpc_proxy_t *)pair->user_data;
     int node_idx = conn->node_index;
 
     /* Calculate elapsed time */
@@ -1389,8 +1074,7 @@ on_upstream_response(upstream_conn_t *conn, void *data)
     uint64_t elapsed_us = elapsed_ns / 1000;
 
     /* Handle late response during drain: proxy already transitioned to IDLE
-     * after sending a non-broadcast winner, but this connection was still
-     * receiving from the previous race. Log and reset just this connection. */
+     * after sending a non-broadcast winner. Log and reset just this connection. */
     if (proxy->state == RACE_IDLE && conn->state == CONN_RECEIVING) {
         log_msg(LOG_DEBUG, "[%s] Late response during drain: method=%s "
                 "elapsed_us=%llu (discarding)",
@@ -1400,9 +1084,10 @@ on_upstream_response(upstream_conn_t *conn, void *data)
 
         /* If no more connections are draining, cancel the safety timeout */
         bool still_draining = false;
-        for (int i = 0; i < proxy->upstream_count; i++) {
-            if (proxy->upstreams[i].state == CONN_RECEIVING ||
-                proxy->upstreams[i].state == CONN_SENDING) {
+        for (int i = 0; i < proxy->pair_count; i++) {
+            upstream_conn_t *active = conn_pair_get_active(&proxy->pairs[i]);
+            if (active && (active->state == CONN_RECEIVING ||
+                active->state == CONN_SENDING)) {
                 still_draining = true;
                 break;
             }
@@ -1413,7 +1098,7 @@ on_upstream_response(upstream_conn_t *conn, void *data)
         return;
     }
 
-    /* Req 9.9: Log warning if elapsed > 5s identifying slow node */
+    /* Log warning if elapsed > 5s identifying slow node */
     if (should_log_slow_response(elapsed_us)) {
         log_msg(LOG_WARN, "[%s] Slow response: elapsed=%.1fs method=%s",
                 conn->config->label,
@@ -1426,6 +1111,12 @@ on_upstream_response(upstream_conn_t *conn, void *data)
 
     /* Check if this response is an error */
     int is_error = response_is_error(conn);
+
+    /* Detect auth failure — critical misconfiguration */
+    if (is_error && parse_http_status(conn) == 401) {
+        log_msg(LOG_CRIT, "[%s] HTTP 401 Unauthorized — check rpcauth configuration",
+                conn->config->label);
+    }
 
     /* Determine if this is a GBT race (fan-out for getblocktemplate) */
     bool is_gbt_race = (strcmp(proxy->method, METHOD_GBT) == 0 &&
@@ -1453,7 +1144,7 @@ on_upstream_response(upstream_conn_t *conn, void *data)
                 node_idx, conn->config->label, proxy->method,
                 (unsigned long long)elapsed_us);
     } else if (is_gbt_race) {
-        /* ---- GBT height validation logic (Req 5.2, 5.3, 5.5, 5.7) ---- */
+        /* ---- GBT height validation logic ---- */
 
         /* Detect IBD recovery */
         if (conn->in_ibd) {
@@ -1465,8 +1156,6 @@ on_upstream_response(upstream_conn_t *conn, void *data)
         int64_t height = parse_gbt_height(conn);
 
         if (height < 0) {
-            /* Could not parse height — treat as valid but with no height info.
-             * For startup (Req 5.7): first valid response wins. */
             log_msg(LOG_WARN, "[rpc_proxy] Upstream[%d] (%s) GBT response "
                     "missing height field", node_idx, conn->config->label);
         }
@@ -1479,9 +1168,7 @@ on_upstream_response(upstream_conn_t *conn, void *data)
                 (long long)proxy->best_gbt_height,
                 (unsigned long long)elapsed_us);
 
-        /* Log each GBT response at INFO with time since notify.
-         * If the request was dispatched before the notify arrived,
-         * since_notify_us is not meaningful (pre-notify request). */
+        /* Log each GBT response at INFO with time since notify. */
         {
             uint64_t since_notify_us = 0;
             bool pre_notify = (proxy->last_notify_ns > 0 &&
@@ -1500,22 +1187,19 @@ on_upstream_response(upstream_conn_t *conn, void *data)
         int64_t expected_height = proxy->last_block_height + 1;
 
         if (!proxy->gbt_height_matched && height == expected_height) {
-            /* Req 5.2: First response matching expected height wins immediately */
+            /* First response matching expected height wins immediately */
             proxy->gbt_height_matched = true;
             proxy->winner_idx = node_idx;
             proxy->sticky_node_idx = node_idx;
 
-            /* Req 5.5: Update last_block_height (monotonicity) */
             if (height > proxy->last_block_height)
                 proxy->last_block_height = height;
 
-            /* Req 9.6: Log race winner */
             log_msg(LOG_INFO, "[%s] GBT race winner (height match): "
                     "height=%lld elapsed_us=%llu",
                     conn->config->label, (long long)height,
                     (unsigned long long)elapsed_us);
 
-            /* Req 9.8: Log additional detail for GBT */
             uint32_t tx_count = parse_gbt_tx_count(conn);
             log_msg(LOG_INFO, "[%s] getblocktemplate response: elapsed_us=%llu "
                     "tx_count=%u",
@@ -1538,11 +1222,44 @@ on_upstream_response(upstream_conn_t *conn, void *data)
             send_upstream_response_to_client(proxy, conn);
 
         } else if (!proxy->gbt_height_matched) {
-            /* No exact match yet — track best height (Req 5.3) */
-            /* Highest height wins; if tied, last received wins */
+            /* No exact match yet — track best height and send first valid
+             * response to client immediately (don't wait for all nodes) */
             if (height >= proxy->best_gbt_height) {
                 proxy->best_gbt_height = height;
                 proxy->best_gbt_node_idx = node_idx;
+            }
+
+            if (proxy->winner_idx == -1) {
+                /* First valid GBT response — send to client immediately */
+                proxy->winner_idx = node_idx;
+                proxy->sticky_node_idx = node_idx;
+
+                if (height > proxy->last_block_height)
+                    proxy->last_block_height = height;
+
+                log_msg(LOG_INFO, "[%s] GBT race winner (first valid): "
+                        "height=%lld elapsed_us=%llu",
+                        conn->config->label, (long long)height,
+                        (unsigned long long)elapsed_us);
+
+                uint32_t tx_count = parse_gbt_tx_count(conn);
+                log_msg(LOG_INFO, "[%s] getblocktemplate response: "
+                        "elapsed_us=%llu tx_count=%u",
+                        conn->config->label,
+                        (unsigned long long)elapsed_us,
+                        (unsigned)tx_count);
+
+                if (proxy->stats) {
+                    uint64_t since_notify_us = 0;
+                    if (proxy->last_notify_ns > 0 &&
+                        conn->request_start_ns >= proxy->last_notify_ns)
+                        since_notify_us = (now_ns - proxy->last_notify_ns) / 1000;
+                    stats_record_gbt(proxy->stats, node_idx, elapsed_us, tx_count, since_notify_us);
+                    stats_record_race_win(proxy->stats, node_idx);
+                    stats_record_notify_to_gbt(proxy->stats, since_notify_us);
+                }
+
+                send_upstream_response_to_client(proxy, conn);
             }
         } else {
             /* Already have an exact match winner — discard */
@@ -1556,7 +1273,6 @@ on_upstream_response(upstream_conn_t *conn, void *data)
             /* First non-error response wins the race */
             proxy->winner_idx = node_idx;
 
-            /* Req 9.6: Log race winner */
             if (proxy->state == RACE_STICKY &&
                 strcmp(proxy->method, METHOD_GBT) == 0) {
                 uint32_t tx_count = parse_gbt_tx_count(conn);
@@ -1574,7 +1290,6 @@ on_upstream_response(upstream_conn_t *conn, void *data)
                         (unsigned long long)elapsed_us);
             }
 
-            /* Req 9.8: Log additional detail for submitblock */
             if (strcmp(proxy->method, METHOD_SUBMITBLOCK) == 0) {
                 log_msg(LOG_INFO, "[%s] %s response: elapsed_us=%llu "
                         "response_bytes=%zu",
@@ -1586,7 +1301,7 @@ on_upstream_response(upstream_conn_t *conn, void *data)
             /* Send response to client */
             send_upstream_response_to_client(proxy, conn);
         } else {
-            /* Subsequent non-error: discard (already have a winner) */
+            /* Subsequent non-error: discard */
             log_msg(LOG_DEBUG, "[rpc_proxy] Upstream[%d] (%s) response "
                     "discarded (winner already selected: node[%d])",
                     node_idx, conn->config->label, proxy->winner_idx);
@@ -1598,74 +1313,67 @@ on_upstream_response(upstream_conn_t *conn, void *data)
         /* All responses received */
         if (proxy->winner_idx == -1) {
             if (is_gbt_race && proxy->best_gbt_node_idx >= 0) {
-                /* GBT height fallback: no exact match, use best height (Req 5.3) */
+                /* GBT height fallback: no exact match, use best height */
                 int best_idx = proxy->best_gbt_node_idx;
-                upstream_conn_t *best_conn = &proxy->upstreams[best_idx];
+                upstream_conn_t *best_conn =
+                    conn_pair_get_active(&proxy->pairs[best_idx]);
 
-                proxy->winner_idx = best_idx;
-                proxy->sticky_node_idx = best_idx;
+                if (best_conn->recv_len > 0) {
+                    proxy->winner_idx = best_idx;
+                    proxy->sticky_node_idx = best_idx;
 
-                /* Req 5.5: Update last_block_height (monotonicity) */
-                if (proxy->best_gbt_height > proxy->last_block_height)
-                    proxy->last_block_height = proxy->best_gbt_height;
+                    if (proxy->best_gbt_height > proxy->last_block_height)
+                        proxy->last_block_height = proxy->best_gbt_height;
 
-                /* Req 9.6: Log race winner */
-                log_msg(LOG_INFO, "[%s] GBT race winner (height fallback): "
-                        "height=%lld elapsed_us=%llu",
-                        best_conn->config->label,
-                        (long long)proxy->best_gbt_height,
-                        (unsigned long long)elapsed_us);
+                    log_msg(LOG_INFO, "[%s] GBT race winner (height fallback): "
+                            "height=%lld elapsed_us=%llu",
+                            best_conn->config->label,
+                            (long long)proxy->best_gbt_height,
+                            (unsigned long long)elapsed_us);
 
-                /* Req 9.8: Log additional detail for GBT */
-                uint32_t tx_count = parse_gbt_tx_count(best_conn);
-                log_msg(LOG_INFO, "[%s] getblocktemplate response: "
-                        "elapsed_us=%llu tx_count=%u",
-                        best_conn->config->label,
-                        (unsigned long long)elapsed_us,
-                        (unsigned)tx_count);
+                    uint32_t tx_count = parse_gbt_tx_count(best_conn);
+                    log_msg(LOG_INFO, "[%s] getblocktemplate response: "
+                            "elapsed_us=%llu tx_count=%u",
+                            best_conn->config->label,
+                            (unsigned long long)elapsed_us,
+                            (unsigned)tx_count);
 
-                /* Record stats */
-                if (proxy->stats) {
-                    uint64_t since_notify_us = 0;
-                    if (proxy->last_notify_ns > 0 &&
-                        best_conn->request_start_ns >= proxy->last_notify_ns)
-                        since_notify_us = (now_ns - proxy->last_notify_ns) / 1000;
-                    stats_record_gbt(proxy->stats, best_idx, elapsed_us, tx_count, since_notify_us);
-                    stats_record_race_win(proxy->stats, best_idx);
-                    stats_record_notify_to_gbt(proxy->stats, since_notify_us);
+                    if (proxy->stats) {
+                        uint64_t since_notify_us = 0;
+                        if (proxy->last_notify_ns > 0 &&
+                            best_conn->request_start_ns >= proxy->last_notify_ns)
+                            since_notify_us = (now_ns - proxy->last_notify_ns) / 1000;
+                        stats_record_gbt(proxy->stats, best_idx, elapsed_us, tx_count, since_notify_us);
+                        stats_record_race_win(proxy->stats, best_idx);
+                        stats_record_notify_to_gbt(proxy->stats, since_notify_us);
+                    }
+
+                    send_upstream_response_to_client(proxy, best_conn);
                 }
-
-                /* Send best response to client */
-                send_upstream_response_to_client(proxy, best_conn);
             } else if (proxy->last_error_idx >= 0) {
-                /* All-error fallback: return last error (Req 4.4, 5.6, 6.4, 7.4) */
-                upstream_conn_t *err_conn = &proxy->upstreams[proxy->last_error_idx];
-                log_msg(LOG_WARN, "[rpc_proxy] All nodes returned errors for "
-                        "method=%s — returning last error from node[%d] (%s)",
-                        proxy->method, proxy->last_error_idx,
-                        err_conn->config->label);
-                send_upstream_response_to_client(proxy, err_conn);
+                /* All-error fallback: return last error */
+                upstream_conn_t *err_conn =
+                    conn_pair_get_active(&proxy->pairs[proxy->last_error_idx]);
+                if (err_conn->recv_len > 0) {
+                    log_msg(LOG_WARN, "[rpc_proxy] All nodes returned errors for "
+                            "method=%s — returning last error from node[%d] (%s)",
+                            proxy->method, proxy->last_error_idx,
+                            err_conn->config->label);
+                    send_upstream_response_to_client(proxy, err_conn);
+                }
             }
         }
         race_complete(proxy);
     } else if (!proxy->all_must_complete && proxy->winner_idx != -1) {
-        /* Non-broadcast winner sent: transition to IDLE immediately so new
-         * client requests are accepted. Late responses from still-pending
-         * nodes will be caught by the early drain check at the top of this
-         * function and reset individually.
-         *
-         * Keep the RPC timeout running as a safety net: if draining
-         * connections never receive a response (node stuck, connection
-         * idle), the timeout will fire and reset them. */
+        /* Non-broadcast winner sent: transition to IDLE immediately */
         proxy->state = RACE_IDLE;
 
-        /* Reset the winner's connection immediately — its response has been
-         * fully read and sent to the client, so it can return to
-         * CONN_CONNECTED for the next request. Also reset the current
-         * connection if it's different from the winner. */
-        upstream_conn_t *winner_conn = &proxy->upstreams[proxy->winner_idx];
-        if (winner_conn->state == CONN_RECEIVING ||
-            winner_conn->state == CONN_SENDING)
+        /* Reset the winner's connection immediately */
+        upstream_conn_t *winner_conn =
+            conn_pair_get_active(&proxy->pairs[proxy->winner_idx]);
+        if (winner_conn &&
+            (winner_conn->state == CONN_RECEIVING ||
+             winner_conn->state == CONN_SENDING))
             rpc_conn_reset(winner_conn);
         if (conn != winner_conn &&
             (conn->state == CONN_RECEIVING || conn->state == CONN_SENDING))
@@ -1675,19 +1383,17 @@ on_upstream_response(upstream_conn_t *conn, void *data)
                 "transitioning to IDLE (%d responses draining)",
                 proxy->responses_pending);
     }
-    /* For broadcast (all_must_complete): always wait for all to finish */
 }
 
 /* Callback: upstream connection failed mid-transfer. */
 static void
 on_upstream_error(upstream_conn_t *conn, void *data)
 {
-    rpc_proxy_t *proxy = (rpc_proxy_t *)data;
+    conn_pair_t *pair = (conn_pair_t *)data;
+    rpc_proxy_t *proxy = (rpc_proxy_t *)pair->user_data;
     int node_idx = conn->node_index;
 
-    /* Handle late error during drain: proxy already transitioned to IDLE
-     * after sending a non-broadcast winner, but this connection errored
-     * from the previous race. Log and reset just this connection. */
+    /* Handle late error during drain */
     if (proxy->state == RACE_IDLE) {
         log_msg(LOG_DEBUG, "[%s] Late error during drain (node_index=%d, "
                 "method=%s) — resetting connection",
@@ -1696,9 +1402,10 @@ on_upstream_error(upstream_conn_t *conn, void *data)
 
         /* If no more connections are draining, cancel the safety timeout */
         bool still_draining = false;
-        for (int i = 0; i < proxy->upstream_count; i++) {
-            if (proxy->upstreams[i].state == CONN_RECEIVING ||
-                proxy->upstreams[i].state == CONN_SENDING) {
+        for (int i = 0; i < proxy->pair_count; i++) {
+            upstream_conn_t *active = conn_pair_get_active(&proxy->pairs[i]);
+            if (active && (active->state == CONN_RECEIVING ||
+                active->state == CONN_SENDING)) {
                 still_draining = true;
                 break;
             }
@@ -1713,7 +1420,48 @@ on_upstream_error(upstream_conn_t *conn, void *data)
             "(node_index=%d)",
             conn->config->label, proxy->method, node_idx);
 
-    /* Decrement pending count */
+    /* Single-retry logic: swap + retry once per node per request.
+     * If this node hasn't been retried yet, attempt swap and retry. */
+    if (!proxy->node_retried[node_idx]) {
+        bool available = conn_pair_report_error(pair);
+
+        if (available) {
+            /* Standby is connected — retry the request once on new active */
+            proxy->node_retried[node_idx] = true;
+            upstream_conn_t *new_active = conn_pair_get_active(pair);
+
+            if (new_active &&
+                rpc_conn_send(new_active, proxy->client_recv_buf,
+                              proxy->request_len) == 0) {
+                log_msg(LOG_INFO, "[%s] Retrying request on standby "
+                        "(node_index=%d, method=%s)",
+                        new_active->config->label, node_idx,
+                        proxy->method);
+                /* Don't decrement responses_pending — still waiting
+                 * for this node's retry response */
+                return;
+            }
+
+            /* rpc_conn_send failed on new active — fall through to
+             * treat as double failure */
+            log_msg(LOG_WARN, "[%s] Retry send failed on new active "
+                    "(node_index=%d)", new_active ? new_active->config->label
+                    : "NULL", node_idx);
+        } else {
+            /* Standby not connected — node is unavailable */
+            proxy->node_retried[node_idx] = true;
+            log_msg(LOG_WARN, "[%s] Swap produced unavailable node "
+                    "(node_index=%d, standby not connected)",
+                    pair->config->label, node_idx);
+        }
+    } else {
+        /* Double failure: this node already used its one retry */
+        log_msg(LOG_WARN, "[%s] Double failure on node_index=%d — "
+                "marking unavailable for this request",
+                conn->config->label, node_idx);
+    }
+
+    /* Node failed (either no retry available, or double failure) */
     proxy->responses_pending--;
 
     /* Track as error for fallback purposes */
@@ -1722,66 +1470,12 @@ on_upstream_error(upstream_conn_t *conn, void *data)
     /* Check if race is over */
     if (proxy->responses_pending <= 0) {
         if (proxy->winner_idx == -1) {
-            /* All nodes failed — check if this is a post-notify GBT that
-             * should enter retry wait instead of immediate error */
-            if (proxy->is_post_notify_gbt &&
-                strcmp(proxy->method, METHOD_GBT) == 0 &&
-                enter_retry_wait(proxy)) {
-                /* Retry wait entered successfully */
-                return;
-            }
-
-            /* Non-GBT, non-post-notify, or retry disabled:
-             * Req 13.3: return error immediately */
-            log_msg(LOG_CRIT, "[rpc_proxy] All nodes failed for method=%s",
-                    proxy->method);
-            send_rpc_error_to_client(proxy, -1,
-                "All upstream nodes failed");
-        }
-        race_complete(proxy);
-    }
-}
-
-/* ---- Reconnect timer ---- */
-
-/* Periodic timer: check disconnected upstreams and attempt reconnection. */
-static void
-reconnect_timer_cb(event_loop_t *loop, void *data)
-{
-    (void)loop;
-    rpc_proxy_t *proxy = (rpc_proxy_t *)data;
-
-    for (int i = 0; i < proxy->upstream_count; i++) {
-        rpc_conn_try_reconnect(&proxy->upstreams[i]);
-    }
-
-    /* Check if all nodes are DEAD — if so, close listener and drop client
-     * to signal the stratum proxy to fail over */
-    bool all_dead = true;
-    for (int i = 0; i < proxy->upstream_count; i++) {
-        if (proxy->upstreams[i].state != CONN_DEAD) {
-            all_dead = false;
-            break;
-        }
-    }
-
-    if (all_dead) {
-        if (proxy->client_connected) {
-            log_msg(LOG_CRIT, "[rpc_proxy] All nodes DEAD — dropping client "
-                    "connection to trigger failover");
+            /* All nodes failed — close client connection (Req 7.2) */
+            log_msg(LOG_CRIT, "[rpc_proxy] All nodes failed for method=%s "
+                    "— closing client", proxy->method);
             close_client(proxy);
         }
-        if (proxy->listen_fd >= 0) {
-            log_msg(LOG_CRIT, "[rpc_proxy] All nodes DEAD — closing listener "
-                    "to refuse new connections");
-            event_loop_del_fd(proxy->loop, proxy->listen_fd);
-            close(proxy->listen_fd);
-            proxy->listen_fd = -1;
-        }
-    } else if (proxy->listen_fd < 0) {
-        /* At least one node is alive again — reopen listener */
-        log_msg(LOG_INFO, "[rpc_proxy] Node recovered — reopening listener");
-        setup_listener(proxy);
+        race_complete(proxy);
     }
 }
 
@@ -1828,47 +1522,37 @@ rpc_proxy_create(event_loop_t *loop, config_t *cfg)
     proxy->method[0] = '\0';
     proxy->stats = NULL;
     proxy->rpc_timeout_timer_fd = -1;
-    proxy->retry_timer_fd = -1;
-    proxy->retry_deadline_timer_fd = -1;
-    proxy->retry_attempts = 0;
-    proxy->is_post_notify_gbt = false;
 
-    /* Initialize upstream connections */
-    proxy->upstream_count = cfg->node_count;
-
-    conn_callbacks_t cb = {0};
-    cb.on_response = on_upstream_response;
-    cb.on_error = on_upstream_error;
-    cb.data = proxy;
+    /* Initialize connection pairs */
+    proxy->pair_count = cfg->node_count;
 
     for (int i = 0; i < cfg->node_count; i++) {
-        if (rpc_conn_init(&proxy->upstreams[i], loop, &cfg->nodes[i], i,
-                          cfg->reconnect_delay_ms, &cb) < 0) {
-            log_msg(LOG_CRIT, "[rpc_proxy] Failed to init upstream[%d] (%s)",
+        if (conn_pair_init(&proxy->pairs[i], loop, &cfg->nodes[i], i) < 0) {
+            log_msg(LOG_CRIT, "[rpc_proxy] Failed to init pair[%d] (%s)",
                     i, cfg->nodes[i].label);
-            /* Clean up already-initialized connections */
+            /* Clean up already-initialized pairs */
             for (int j = 0; j < i; j++)
-                rpc_conn_destroy(&proxy->upstreams[j]);
+                conn_pair_destroy(&proxy->pairs[j]);
             free(proxy->client_recv_buf);
             free(proxy);
             return NULL;
         }
-    }
 
-    /* Initiate connections to all upstream nodes immediately (Req 14.1) */
-    for (int i = 0; i < cfg->node_count; i++) {
-        rpc_conn_connect(&proxy->upstreams[i]);
-    }
+        /* Set response/error callbacks so the proxy gets notified
+         * when data arrives or errors occur on either slot. */
+        conn_pair_set_callbacks(&proxy->pairs[i],
+                                on_upstream_response, on_upstream_error,
+                                proxy);
 
-    /* Reconnect timer: check every 1 second for disconnected nodes */
-    if (event_loop_add_timer(loop, 1000, reconnect_timer_cb, proxy) < 0) {
-        log_msg(LOG_WARN, "[rpc_proxy] Failed to create reconnect timer");
+        log_msg(LOG_INFO, "[rpc_proxy] Upstream pair[%d] (%s) → %s:%u",
+                i, cfg->nodes[i].label, cfg->nodes[i].host,
+                cfg->nodes[i].rpc_port);
     }
 
     /* Set up the RPC listener */
     if (setup_listener(proxy) < 0) {
         for (int i = 0; i < cfg->node_count; i++)
-            rpc_conn_destroy(&proxy->upstreams[i]);
+            conn_pair_destroy(&proxy->pairs[i]);
         free(proxy->client_recv_buf);
         free(proxy);
         return NULL;
@@ -1886,18 +1570,6 @@ rpc_proxy_destroy(rpc_proxy_t *proxy)
     /* Cancel any active timeout timer */
     cancel_rpc_timeout(proxy);
 
-    /* Clean up retry timers if active */
-    if (proxy->retry_timer_fd >= 0) {
-        event_loop_del_fd(proxy->loop, proxy->retry_timer_fd);
-        close(proxy->retry_timer_fd);
-        proxy->retry_timer_fd = -1;
-    }
-    if (proxy->retry_deadline_timer_fd >= 0) {
-        event_loop_del_fd(proxy->loop, proxy->retry_deadline_timer_fd);
-        close(proxy->retry_deadline_timer_fd);
-        proxy->retry_deadline_timer_fd = -1;
-    }
-
     /* Close client connection */
     if (proxy->client_connected)
         close_client(proxy);
@@ -1909,9 +1581,9 @@ rpc_proxy_destroy(rpc_proxy_t *proxy)
         proxy->listen_fd = -1;
     }
 
-    /* Destroy upstream connections */
-    for (int i = 0; i < proxy->upstream_count; i++)
-        rpc_conn_destroy(&proxy->upstreams[i]);
+    /* Destroy connection pairs */
+    for (int i = 0; i < proxy->pair_count; i++)
+        conn_pair_destroy(&proxy->pairs[i]);
 
     /* Free client buffer */
     free(proxy->client_recv_buf);
@@ -1926,7 +1598,7 @@ rpc_proxy_on_block_notify(rpc_proxy_t *proxy, const uint8_t *hash)
     if (!proxy)
         return;
 
-    (void)hash;  /* Hash used for logging; height tracking done via GBT response */
+    (void)hash;
 
     /* Clear sticky state — next GBT will race */
     proxy->sticky_node_idx = -1;
@@ -1936,22 +1608,6 @@ rpc_proxy_on_block_notify(rpc_proxy_t *proxy, const uint8_t *hash)
     /* Record notify time in stats */
     if (proxy->stats)
         stats_record_notify_time(proxy->stats, proxy->last_notify_ns);
-
-    /* Do NOT transition RACE_STICKY → RACE_IDLE here. If a sticky GBT is
-     * in-flight, let it complete normally and send the response to the client.
-     * The client will then send a new GBT request which will see
-     * notify_pending=true and race all nodes for the new block.
-     *
-     * Transitioning to IDLE while a sticky request is in-flight would orphan
-     * the response (drain path discards it), leaving the client with no
-     * response until its own timeout fires (e.g., 60s).
-     *
-     * INTENTIONAL: Do NOT cancel retry timers or abort RACE_RETRY_WAIT here.
-     * If a post-notify GBT retry is in progress, the retry is for THIS block's
-     * GBT. When the retry succeeds and re-dispatches, the response will be for
-     * the current (latest) block. Sticky clearing above ensures the next GBT
-     * after the retry completes will race again if another notify arrives.
-     * (Req 3.6: Block notify during retry does not abort the retry.) */
 
     log_msg(LOG_INFO, "[rpc_proxy] Block notify received — sticky cleared, "
             "next GBT will race");
@@ -1970,19 +1626,21 @@ rpc_proxy_get_states(rpc_proxy_t *proxy, const char **out, int count)
     if (!proxy || !out)
         return;
 
-    for (int i = 0; i < count && i < proxy->upstream_count; i++) {
-        if (proxy->upstreams[i].in_ibd) {
+    for (int i = 0; i < count && i < proxy->pair_count; i++) {
+        upstream_conn_t *active = conn_pair_get_active(&proxy->pairs[i]);
+
+        if (active->in_ibd) {
             out[i] = "ibd";
             continue;
         }
-        switch (proxy->upstreams[i].state) {
+
+        switch (active->state) {
         case CONN_DISCONNECTED: out[i] = "disconnected"; break;
         case CONN_CONNECTING:   out[i] = "connecting";   break;
         case CONN_CONNECTED:    out[i] = "connected";    break;
         case CONN_SENDING:      out[i] = "sending";      break;
-        case CONN_RECEIVING:    out[i] = "receiving";    break;
-        case CONN_DEAD:         out[i] = "dead";         break;
-        default:                out[i] = "unknown";      break;
+        case CONN_RECEIVING:    out[i] = "receiving";     break;
+        default:                out[i] = "unknown";       break;
         }
     }
 }
@@ -1990,7 +1648,7 @@ rpc_proxy_get_states(rpc_proxy_t *proxy, const char **out, int count)
 bool
 rpc_proxy_is_node_ibd(rpc_proxy_t *proxy, int node_idx)
 {
-    if (!proxy || node_idx < 0 || node_idx >= proxy->upstream_count)
+    if (!proxy || node_idx < 0 || node_idx >= proxy->pair_count)
         return false;
-    return proxy->upstreams[node_idx].in_ibd;
+    return proxy->pairs[node_idx].slots[proxy->pairs[node_idx].active_idx].in_ibd;
 }

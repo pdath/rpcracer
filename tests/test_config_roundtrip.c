@@ -154,8 +154,6 @@ gen_random_config(config_t *cfg)
 
     /* Timeouts: 1–100000 */
     cfg->rpc_timeout_ms = (uint32_t)(1 + (lrand48() % 100000));
-    cfg->reconnect_delay_ms = (uint32_t)(1 + (lrand48() % 100000));
-    cfg->stall_threshold_ms = (uint32_t)(1 + (lrand48() % 100000));
 
     /* Verbosity: 0–3 */
     cfg->log_verbosity = (int)(lrand48() % 4);
@@ -205,8 +203,6 @@ serialize_config_to_file(const config_t *cfg, const char *path)
     }
 
     yyjson_mut_obj_add_int(doc, root, "rpc_timeout_ms", (int64_t)cfg->rpc_timeout_ms);
-    yyjson_mut_obj_add_int(doc, root, "reconnect_delay_ms", (int64_t)cfg->reconnect_delay_ms);
-    yyjson_mut_obj_add_int(doc, root, "stall_threshold_ms", (int64_t)cfg->stall_threshold_ms);
     yyjson_mut_obj_add_int(doc, root, "log_verbosity", (int64_t)cfg->log_verbosity);
 
     /* Write to file */
@@ -296,16 +292,6 @@ compare_configs(const config_t *expected, const config_t *actual, int trial)
     if (expected->rpc_timeout_ms != actual->rpc_timeout_ms) {
         fprintf(stderr, "  FAIL trial %d: rpc_timeout_ms %u != %u\n",
                 trial, expected->rpc_timeout_ms, actual->rpc_timeout_ms);
-        return -1;
-    }
-    if (expected->reconnect_delay_ms != actual->reconnect_delay_ms) {
-        fprintf(stderr, "  FAIL trial %d: reconnect_delay_ms %u != %u\n",
-                trial, expected->reconnect_delay_ms, actual->reconnect_delay_ms);
-        return -1;
-    }
-    if (expected->stall_threshold_ms != actual->stall_threshold_ms) {
-        fprintf(stderr, "  FAIL trial %d: stall_threshold_ms %u != %u\n",
-                trial, expected->stall_threshold_ms, actual->stall_threshold_ms);
         return -1;
     }
     if (expected->log_verbosity != actual->log_verbosity) {
