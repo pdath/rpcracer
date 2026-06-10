@@ -28,6 +28,7 @@
     "zmq_server_bind": "0.0.0.0",
     "zmq_server_port": 28332,
     "notify_http_url": "http://127.0.0.1:7152/NOTIFY/%s",
+    "ck_notify_socket": "/tmp/ckpool/stratifier",
 
     "rpc_timeout_ms": 30000,
 

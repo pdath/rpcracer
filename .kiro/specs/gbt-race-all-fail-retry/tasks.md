@@ -149,7 +149,7 @@ Fix the GBT race all-fail immediate error behavior by adding a bounded retry loo
   - Test retry disabled (`gbt_retry_timeout_ms = 0`): all-fail post-notify GBT returns error immediately (no retry)
   - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6_
 
-- [-] 5. Write integration tests
+- [ ] 5. Write integration tests
   - Full flow: block notify → GBT request → all nodes disconnected → node reconnects within 2s → GBT response delivered to client (verify response content is valid GBT)
   - Full flow: block notify → GBT request → all nodes fail mid-transfer (on_upstream_error path) → node reconnects within timeout → re-dispatch succeeds
   - Full flow: block notify → GBT request → all nodes fail → no reconnect within timeout → error delivered to client after `gbt_retry_timeout_ms`
@@ -158,7 +158,7 @@ Fix the GBT race all-fail immediate error behavior by adding a bounded retry loo
   - Single node configuration: node disconnects during post-notify GBT → enters retry → node reconnects → GBT dispatched and response delivered
   - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 3.2, 3.6_
 
-- [~] 6. Checkpoint - Ensure all tests pass
+- [ ] 6. Checkpoint - Ensure all tests pass
   - Deploy to remote test machine: `scp -r Makefile configure src/ include/ tests/ deploy/ odroid:~/rpcrace/`
   - Build on remote: `ssh odroid "cd ~/rpcrace && ./configure && make clean && make"`
   - Run full test suite: `ssh odroid "cd ~/rpcrace && make test"`

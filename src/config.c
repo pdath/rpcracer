@@ -308,14 +308,37 @@ config_load(const char *path)
     }
     cfg->log_verbosity = (int)verb;
 
+    /* ck_notify_socket (optional Unix socket path, empty = disabled) */
+    yyjson_val *ck_val = yyjson_obj_get(root, "ck_notify_socket");
+    if (ck_val) {
+        if (!yyjson_is_str(ck_val)) {
+            log_msg(LOG_CRIT, "[config] Field 'ck_notify_socket' has invalid type (expected string)");
+            goto fail;
+        }
+        const char *ck_str = yyjson_get_str(ck_val);
+        size_t ck_len = strlen(ck_str);
+        if (ck_len == 0) {
+            cfg->ck_notify_socket[0] = '\0';
+        } else if (ck_len <= 107) {
+            memcpy(cfg->ck_notify_socket, ck_str, ck_len + 1);
+        } else {
+            log_msg(LOG_CRIT, "[config] Field 'ck_notify_socket' too long "
+                    "(%zu chars, max 107)", ck_len);
+            goto fail;
+        }
+    } else {
+        cfg->ck_notify_socket[0] = '\0';
+    }
+
     /* Validation: unique labels */
     if (validate_unique_labels(cfg) != 0)
         goto fail;
 
     /* Validation: warn if no downstream notify method configured */
-    if (cfg->zmq_server_port == 0 && cfg->notify_http_url[0] == '\0') {
+    if (cfg->zmq_server_port == 0 && cfg->notify_http_url[0] == '\0' &&
+        cfg->ck_notify_socket[0] == '\0') {
         log_msg(LOG_WARN, "[config] No downstream notification method configured "
-                "(neither zmq_server_port nor notify_http_url)");
+                "(neither zmq_server_port, notify_http_url, nor ck_notify_socket)");
     }
 
     yyjson_doc_free(doc);

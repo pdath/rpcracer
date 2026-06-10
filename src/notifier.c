@@ -15,6 +15,7 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -70,6 +71,11 @@ struct notifier {
     uint16_t notify_http_port;
     char notify_http_path[512];     /* path portion of URL (with %s or as-is) */
     bool notify_http_configured;
+
+    /* CK socket relay state */
+    int ck_fd;                    /* Unix socket fd, -1 if disconnected */
+    char ck_path[108];            /* configured socket path */
+    bool ck_configured;           /* true if path is non-empty */
 
     /* Silence detection: per-node tracking.
      * node_map[i] maps zmq_sub index i to the config node index.
@@ -369,6 +375,82 @@ set_nonblocking(int fd)
     if (flags < 0)
         return -1;
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/* Attempt to connect to the CK stratifier socket.
+ * Returns the connected fd (set to O_NONBLOCK), or -1 on failure. */
+static int
+ck_connect(const char *path)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    if (set_nonblocking(fd) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    log_msg(LOG_INFO, "[notifier] [ck] connected to %s", path);
+    return fd;
+}
+
+/* Send the "update" command to ckpool via the CK socket relay.
+ * Handles write errors, reconnection, and logging. */
+static void
+relay_ck_notify(notifier_t *n, const uint8_t *hash)
+{
+    if (!n->ck_configured)
+        return;
+
+    static const uint8_t CK_UPDATE_MSG[10] = {
+        0x06, 0x00, 0x00, 0x00,       /* length prefix: 6 in LE */
+        'u', 'p', 'd', 'a', 't', 'e'  /* payload */
+    };
+
+    /* Reconnect on demand if disconnected */
+    if (n->ck_fd < 0) {
+        n->ck_fd = ck_connect(n->ck_path);
+        if (n->ck_fd < 0) {
+            log_msg(LOG_WARN, "[notifier] [ck] reconnect to %s failed: %s",
+                    n->ck_path, strerror(errno));
+            return;
+        }
+    }
+
+    /* Single non-blocking write, no retry */
+    ssize_t ret = write(n->ck_fd, CK_UPDATE_MSG, sizeof(CK_UPDATE_MSG));
+
+    if (ret == (ssize_t)sizeof(CK_UPDATE_MSG)) {
+        /* Success */
+        char hex[HEX_HASH_LEN];
+        hex_encode(hash, HASH_SIZE, hex);
+        log_msg(LOG_INFO, "[notifier] [ck] relay: %s", hex);
+    } else if (ret < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            log_msg(LOG_WARN, "[notifier] [ck] write would block, dropping notification");
+        } else {
+            log_msg(LOG_WARN, "[notifier] [ck] write failed: %s", strerror(errno));
+            close(n->ck_fd);
+            n->ck_fd = -1;
+        }
+    } else {
+        /* Partial write (0 < ret < 10) */
+        log_msg(LOG_WARN, "[notifier] [ck] partial write (%zd/10), disconnecting",
+                ret);
+        close(n->ck_fd);
+        n->ck_fd = -1;
+    }
 }
 
 /* Attempt to establish a non-blocking TCP connection to the HTTP notify host.
@@ -740,6 +822,21 @@ notifier_create(event_loop_t *loop, config_t *cfg, notify_cb cb, void *data)
                 n->notify_http_path);
     }
 
+    /* Initialize CK socket relay state */
+    memcpy(n->ck_path, cfg->ck_notify_socket, sizeof(n->ck_path));
+    n->ck_configured = (n->ck_path[0] != '\0');
+    n->ck_fd = -1;
+
+    /* Attempt initial CK socket connection */
+    if (n->ck_configured) {
+        n->ck_fd = ck_connect(n->ck_path);
+        if (n->ck_fd < 0) {
+            log_msg(LOG_WARN, "[notifier] [ck] initial connect to %s failed: %s",
+                    n->ck_path, strerror(errno));
+            /* Non-fatal — will retry on first notification */
+        }
+    }
+
     /* Register silence detection timer (checks every 10s) */
     if (n->total_notify_sources > 1) {
         if (event_loop_add_timer(loop, SILENCE_CHECK_INTERVAL_MS,
@@ -781,6 +878,11 @@ notifier_destroy(notifier_t *n)
     /* Close HTTP notify socket if open */
     if (n->notify_http_fd >= 0) {
         close(n->notify_http_fd);
+    }
+
+    /* Close CK socket relay if connected */
+    if (n->ck_fd >= 0) {
+        close(n->ck_fd);
     }
 
     /* Destroy ZMQ context */
@@ -896,6 +998,7 @@ notifier_process_hash(notifier_t *n, const uint8_t *hash,
             /* Still relay downstream (subscribers may want all notifications) */
             relay_zmq_pub(n, hash);
             relay_http_notify(n, hash);
+            relay_ck_notify(n, hash);
             return 0;
         }
         /* Grace period expired or winning node reported — fall through to accept */
@@ -934,6 +1037,9 @@ notifier_process_hash(notifier_t *n, const uint8_t *hash,
 
     /* Downstream relay: HTTP notify (Req 3.3, 3.4) */
     relay_http_notify(n, hash);
+
+    /* Downstream relay: CK socket notify */
+    relay_ck_notify(n, hash);
 
     return 1;
 }

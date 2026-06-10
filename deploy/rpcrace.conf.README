@@ -62,8 +62,17 @@ DOWNSTREAM NOTIFICATION RELAY
                      replaced with the 64-character hex block hash. If "%s" is
                      absent, the URL is requested as-is.
 
-At least one downstream notification method should be configured. If neither is
-set, rpcrace logs a warning at startup.
+"ck_notify_socket" — (Optional) Unix domain socket path for sending "update"
+                     notifications to ckpool's stratifier. When configured,
+                     rpcrace sends a 10-byte length-prefixed "update" command
+                     to this socket each time a new block is accepted. Uses
+                     non-blocking I/O with reconnect-on-demand semantics.
+                     Path must be 1–107 characters (Unix socket path limit).
+                     If empty or omitted, CK socket relay is disabled.
+
+At least one downstream notification method should be configured. If none of
+zmq_server_port, notify_http_url, or ck_notify_socket is set, rpcrace logs a
+warning at startup.
 
 TIMEOUTS AND TUNING
 -------------------

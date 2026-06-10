@@ -33,6 +33,7 @@ typedef struct {
     char zmq_server_bind[64];     /* ZMQ PUB bind address, e.g. "0.0.0.0" */
     uint16_t zmq_server_port;     /* ZMQ PUB port, 0 = disabled */
     char notify_http_url[512];    /* HTTP GET URL template for stratum proxy, %s = hash */
+    char ck_notify_socket[108];   /* Unix socket path for CK notify, empty = disabled */
 
     /* Timeouts and tuning */
     uint32_t rpc_timeout_ms;       /* global RPC timeout in milliseconds */
